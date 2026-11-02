@@ -8,6 +8,7 @@
 #include "rv32i_base.h"
 #include "assembler.h"
 #include "cli_display.h"
+#include "pipeline_state.h"
 
 #define DEFAULT_MEM_SIZE   (1u << 20)   /* 1 MB */
 #define DEFAULT_MAX_CYCLES 1000000ull
@@ -16,7 +17,9 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <program.s> [options]\n"
         "  --batch              run to completion with no interaction, then dump state\n"
-        "  --max-cycles N       cycle limit for --batch mode (default %llu)\n"
+        "  --pipeline           run on five-stage pipeline with stalling only\n"
+        "  --pipeline-forward   run on five-stage pipeline with data forwarding\n"
+        "  --max-cycles N       cycle limit for batch/pipeline mode (default %llu)\n"
         "  --mem-size N         memory size in bytes (default %u)\n",
         prog, (unsigned long long)DEFAULT_MAX_CYCLES, DEFAULT_MEM_SIZE);
 }
@@ -29,12 +32,20 @@ int main(int argc, char **argv) {
 
     const char *program_path = argv[1];
     int batch_mode = 0;
+    int pipeline_mode = 0;
+    int forwarding = 0;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint32_t mem_size = DEFAULT_MEM_SIZE;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--batch") == 0) {
             batch_mode = 1;
+        } else if (strcmp(argv[i], "--pipeline") == 0) {
+            pipeline_mode = 1;
+            forwarding = 0;
+        } else if (strcmp(argv[i], "--pipeline-forward") == 0) {
+            pipeline_mode = 1;
+            forwarding = 1;
         } else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--mem-size") == 0 && i + 1 < argc) {
@@ -75,7 +86,11 @@ int main(int argc, char **argv) {
     CPUState cpu;
     cpu_reset(&cpu, entry_point);
 
-    if (batch_mode) {
+    if (pipeline_mode) {
+        Pipeline pipe;
+        pipeline_init(&pipe, forwarding);
+        pipeline_run_batch(&pipe, &cpu, &mem, max_cycles);
+    } else if (batch_mode) {
         run_batch(&cpu, &mem, max_cycles);
     } else {
         run_repl(&cpu, &mem);
