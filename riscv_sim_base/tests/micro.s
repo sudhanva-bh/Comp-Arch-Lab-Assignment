@@ -6,3 +6,4 @@ main:
     add  t2, t1, t0         # I3  @0x08   RAW on t1 (d=1) and t0 (d=2)
     addi a7, zero, 10       # I4  @0x0c
     ecall                   # I5  @0x10
+

@@ -15,6 +15,9 @@ SRCS := \
 	assembler/assembler.c \
 	pipeline/control.c \
 	pipeline/hazard.c \
+	pipeline/branch_predictor.c \
+	pipeline/bp_static.c \
+	pipeline/bp_dynamic.c \
 	pipeline/pipeline.c \
 	ui/cli_display.c \
 	main.c

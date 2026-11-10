@@ -2,12 +2,18 @@
 #include "hazard.h"
 #include "decoder.h"
 #include "cli_display.h"
+#include "branch_predictor.h"
 #include <stdio.h>
 #include <string.h>
 
-void pipeline_init(Pipeline *p, int forwarding) {
+void pipeline_init(Pipeline *p, int forwarding, const BranchPredictor *predictor, int trace_mode) {
     memset(p, 0, sizeof(*p));
     p->forwarding = forwarding;
+    p->trace_mode = trace_mode;
+    p->predictor  = predictor;
+    if (p->predictor && p->predictor->reset) {
+        p->predictor->reset(&p->bp_state);
+    }
 }
 
 static uint32_t alu(const DecodedInstr *i, uint32_t pc, uint32_t a, uint32_t b) {
@@ -87,8 +93,9 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
     nx.cycles = p->cycles + 1;
 
     int stall = 0;
-    int flush = 0;
+    int squash = 0;
     uint32_t redirect_pc = 0;
+    uint32_t current_fetch_pc = cpu->pc;
 
     /* -------------------------------------------------------------
      * 1. WB Stage (reads p->mem_wb)
@@ -233,17 +240,52 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
             nx.ex_mem.store_val = o.b;
 
             if (p->id_ex.ctrl.is_branch) {
-                if (branch_taken(p->id_ex.instr.funct3, o.a, o.b)) {
-                    flush = 1;
-                    redirect_pc = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
+                int taken = branch_taken(p->id_ex.instr.funct3, o.a, o.b);
+                uint32_t target = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
+                uint32_t real_next = taken ? target : (p->id_ex.pc + 4);
+
+                if (p->predictor != NULL) {
+                    nx.branches++;
+                    p->predictor->update(&nx.bp_state, p->id_ex.pc, target, taken);
+                    if (real_next != p->id_ex.pred_next) {
+                        /* Mispredict */
+                        nx.mispredicts++;
+                        nx.redirects++;
+                        squash = 1;
+                        redirect_pc = real_next;
+                    }
+                } else {
+                    /* Lab 2 / Lab 3 baseline without branch prediction (naive branch resolution) */
+                    if (taken) {
+                        nx.flushes++;
+                        squash = 1;
+                        redirect_pc = target;
+                    }
                 }
             } else if (p->id_ex.ctrl.is_jump) {
                 nx.ex_mem.alu_result = p->id_ex.pc + 4;
-                flush = 1;
                 if (p->id_ex.instr.opcode == 0x67) { /* jalr */
-                    redirect_pc = (o.a + (uint32_t)p->id_ex.instr.imm) & ~1u;
+                    uint32_t real_next = (o.a + (uint32_t)p->id_ex.instr.imm) & ~1u;
+                    if (p->predictor != NULL) {
+                        nx.jalr_count++;
+                        nx.redirects++;
+                        squash = 1;
+                        redirect_pc = real_next;
+                    } else {
+                        nx.flushes++;
+                        squash = 1;
+                        redirect_pc = real_next;
+                    }
                 } else { /* jal */
-                    redirect_pc = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
+                    if (p->predictor != NULL) {
+                        nx.jal_count++;
+                        /* JAL target was statically resolved in IF -> 0 cycle penalty */
+                    } else {
+                        /* Lab 2 / Lab 3 without pre-decode redirects in EX */
+                        nx.flushes++;
+                        squash = 1;
+                        redirect_pc = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
+                    }
                 }
             } else {
                 nx.ex_mem.alu_result = alu(&p->id_ex.instr, p->id_ex.pc, o.a, o.b);
@@ -255,8 +297,8 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
      * 4. ID Stage (reads p->if_id, writes nx.id_ex)
      * ------------------------------------------------------------- */
     nx.id_ex.valid = 0;
-    if (flush) {
-        /* Branch/jump taken in EX: squash whatever is in IF/ID */
+    if (squash) {
+        /* Branch mispredict or jump redirect squashes ID */
         nx.id_ex.valid = 0;
     } else if (p->if_id.valid) {
         DecodedInstr d;
@@ -283,6 +325,7 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
             nx.id_ex.instr = d;
             nx.id_ex.handler = h;
             nx.id_ex.ctrl = ctrl;
+            nx.id_ex.pred_next = p->if_id.pred_next;
             nx.id_ex.rs1_val = cpu_read_reg(cpu, d.rs1);
             nx.id_ex.rs2_val = cpu_read_reg(cpu, d.rs2);
         }
@@ -291,19 +334,11 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
     /* -------------------------------------------------------------
      * 5. IF Stage (writes nx.if_id)
      * ------------------------------------------------------------- */
-    if (flush) {
-        nx.flushes++;
-        uint32_t raw = 0;
-        nx.if_id.valid = 1;
-        nx.if_id.pc = redirect_pc;
-        if (memory_read_word(mem, redirect_pc, &raw) != MEM_OK) {
-            nx.if_id.fault = PF_FETCH;
-            nx.if_id.raw = 0;
-        } else {
-            nx.if_id.fault = PF_NONE;
-            nx.if_id.raw = raw;
-        }
-        cpu->pc = redirect_pc + 4;
+    if (squash) {
+        /* 2-cycle penalty: squashes instruction fetched in IF and redirects fetch PC */
+        nx.if_id.valid = 0;
+        cpu->pc = redirect_pc;
+        nx.squashed += 2;
     } else if (stall) {
         /* IF is frozen: nx.if_id is already p->if_id from ID, cpu->pc unchanged */
     } else {
@@ -314,11 +349,64 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
         if (memory_read_word(mem, fetch_pc, &raw) != MEM_OK) {
             nx.if_id.fault = PF_FETCH;
             nx.if_id.raw = 0;
+            nx.if_id.pred_next = fetch_pc + 4;
+            cpu->pc = fetch_pc + 4;
         } else {
             nx.if_id.fault = PF_NONE;
             nx.if_id.raw = raw;
+
+            uint32_t pred_next = fetch_pc + 4;
+            if (p->predictor != NULL) {
+                uint32_t opcode = raw & 0x7F;
+                if (opcode == 0x63) { /* conditional branch */
+                    int32_t b12   = (int32_t)((raw >> 31) & 0x1);
+                    int32_t b11   = (int32_t)((raw >> 7)  & 0x1);
+                    int32_t b10_5 = (int32_t)((raw >> 25) & 0x3F);
+                    int32_t b4_1  = (int32_t)((raw >> 8)  & 0xF);
+                    int32_t v = (b12 << 12) | (b11 << 11) | (b10_5 << 5) | (b4_1 << 1);
+                    if (v & 0x1000) v |= 0xFFFFE000;
+                    uint32_t target = fetch_pc + (uint32_t)v;
+
+                    if (p->predictor->predict(&p->bp_state, fetch_pc, target)) {
+                        pred_next = target;
+                    } else {
+                        pred_next = fetch_pc + 4;
+                    }
+                } else if (opcode == 0x6F) { /* JAL */
+                    int32_t b20    = (int32_t)((raw >> 31) & 0x1);
+                    int32_t b19_12 = (int32_t)((raw >> 12) & 0xFF);
+                    int32_t b11    = (int32_t)((raw >> 20) & 0x1);
+                    int32_t b10_1  = (int32_t)((raw >> 21) & 0x3FF);
+                    int32_t v = (b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1);
+                    if (v & 0x100000) v |= 0xFFE00000;
+                    pred_next = fetch_pc + (uint32_t)v;
+                } else {
+                    pred_next = fetch_pc + 4;
+                }
+            } else {
+                pred_next = fetch_pc + 4;
+            }
+
+            nx.if_id.pred_next = pred_next;
+            cpu->pc = pred_next;
         }
-        cpu->pc = fetch_pc + 4;
+    }
+
+    /* Trace logging */
+    if (p->trace_mode) {
+        char if_s[16], id_s[16], ex_s[16], mem_s[16], wb_s[16];
+        snprintf(if_s, sizeof(if_s), "0x%08x", current_fetch_pc);
+        if (p->if_id.valid) snprintf(id_s, sizeof(id_s), "0x%08x", p->if_id.pc);
+        else snprintf(id_s, sizeof(id_s), "----------");
+        if (p->id_ex.valid) snprintf(ex_s, sizeof(ex_s), "0x%08x", p->id_ex.pc);
+        else snprintf(ex_s, sizeof(ex_s), "----------");
+        if (p->ex_mem.valid) snprintf(mem_s, sizeof(mem_s), "0x%08x", p->ex_mem.pc);
+        else snprintf(mem_s, sizeof(mem_s), "----------");
+        if (p->mem_wb.valid) snprintf(wb_s, sizeof(wb_s), "0x%08x", p->mem_wb.pc);
+        else snprintf(wb_s, sizeof(wb_s), "----------");
+
+        fprintf(stdout, "[cycle %llu] IF %s | ID %s | EX %s | MEM %s | WB %s\n",
+                (unsigned long long)p->cycles + 1, if_s, id_s, ex_s, mem_s, wb_s);
     }
 
     /* Commit */
@@ -337,15 +425,36 @@ void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cy
     if (cpu->status == CPU_RUNNING) {
         printf("  -> stopped: reached max cycle limit (%llu)\n", (unsigned long long)max_cycles);
     }
-    printf("pipeline: mode=%s cycles=%llu retired=%llu stalls=%llu flushes=%llu "
-           "CPI=%.3f fwd_ex=%llu fwd_mem=%llu load_use=%llu\n",
-           p->forwarding ? "forward" : "stall",
-           (unsigned long long)p->cycles,
-           (unsigned long long)p->retired,
-           (unsigned long long)p->stalls,
-           (unsigned long long)p->flushes,
-           p->retired > 0 ? (double)p->cycles / (double)p->retired : 0.0,
-           (unsigned long long)p->fwd_ex,
-           (unsigned long long)p->fwd_mem,
-           (unsigned long long)p->load_use_stalls);
+
+    if (p->predictor != NULL) {
+        /* Lab 4 Branch Predictor Summary Banner */
+        printf("pipeline            = 5-stage, hazard unit '%s', predictor '%s'\n",
+               p->forwarding ? "forward" : "stall",
+               p->predictor->name);
+        printf("retired             = %llu\n", (unsigned long long)p->retired);
+        printf("CPI                 = %.3f\n", p->retired > 0 ? (double)p->cycles / (double)p->retired : 0.0);
+        printf("stalls              = %llu\n", (unsigned long long)p->stalls);
+        printf("forwards            = %llu\n", (unsigned long long)(p->fwd_ex + p->fwd_mem));
+        printf("branches            = %llu        conditional branches executed\n", (unsigned long long)p->branches);
+        printf("mispredicts         = %llu         ... of which the guess was wrong\n", (unsigned long long)p->mispredicts);
+        double acc = (p->branches > 0) ? (100.0 * (double)(p->branches - p->mispredicts) / (double)p->branches) : 0.0;
+        printf("accuracy            = %.1f%%\n", acc);
+        printf("jal                 = %llu         redirected in IF: free\n", (unsigned long long)p->jal_count);
+        printf("jalr                = %llu         never predicted: 2 cycles each\n", (unsigned long long)p->jalr_count);
+        printf("redirects           = %llu         mispredicts + jalr\n", (unsigned long long)p->redirects);
+        printf("squashed            = %llu         instructions thrown away (2 per redirect)\n", (unsigned long long)p->squashed);
+    } else {
+        /* Lab 2 / Lab 3 Summary Line */
+        printf("pipeline: mode=%s cycles=%llu retired=%llu stalls=%llu flushes=%llu "
+               "CPI=%.3f fwd_ex=%llu fwd_mem=%llu load_use=%llu\n",
+               p->forwarding ? "forward" : "stall",
+               (unsigned long long)p->cycles,
+               (unsigned long long)p->retired,
+               (unsigned long long)p->stalls,
+               (unsigned long long)p->flushes,
+               p->retired > 0 ? (double)p->cycles / (double)p->retired : 0.0,
+               (unsigned long long)p->fwd_ex,
+               (unsigned long long)p->fwd_mem,
+               (unsigned long long)p->load_use_stalls);
+    }
 }

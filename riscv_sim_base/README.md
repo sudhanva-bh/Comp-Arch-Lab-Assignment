@@ -95,17 +95,33 @@ build artifacts.
 ## Running
 
 ```bash
-./rvsim <program.s>              # interactive step-debugger (default)
-./rvsim <program.s> --batch      # run to completion, dump final state (for grading scripts)
-./rvsim <program.s> --batch --max-cycles 500000
-./rvsim <program.s> --mem-size 2097152   # override the default 1 MB memory
+./rvsim <program.s>                    # interactive step-debugger (default)
+./rvsim <program.s> --batch            # single-cycle batch mode (reference oracle)
+./rvsim <program.s> --pipeline         # 5-stage pipeline with stalling only (Lab 2)
+./rvsim <program.s> --pipeline-forward # 5-stage pipeline with data forwarding (Lab 3)
+./rvsim <program.s> --batch --predictor <not-taken|btfn|1bit|2bit> # Branch prediction (Lab 4)
+./rvsim <program.s> --batch --predictor 2bit --trace              # Cycle-by-cycle ASCII pipeline trace
+./rvsim <program.s> --max-cycles 500000
+./rvsim <program.s> --mem-size 2097152 # override the default 1 MB memory
 ```
 
 Try it on the provided sample programs:
 
 ```bash
+# 1. Single-cycle execution (Lab 1)
 ./rvsim tests/sample1_sum_loop.s --batch
-./rvsim tests/sample2_mem_and_branches.s --batch
+
+# 2. Pipelined execution with stalling (Lab 2)
+./rvsim tests/sample1_sum_loop.s --pipeline
+
+# 3. Pipelined execution with forwarding & load-use interlocks (Lab 3)
+./rvsim tests/sample1_sum_loop.s --pipeline-forward
+
+# 4. Branch prediction benchmarks (Lab 4)
+./rvsim tests/t1_counted_loop.s --batch --predictor btfn
+./rvsim tests/t2_nested_loops.s --batch --predictor 2bit
+./rvsim tests/t3_alternating.s --batch --predictor 2bit
+./rvsim tests/t4_calls.s --batch --predictor 2bit
 ```
 
 or run both as a quick smoke test:

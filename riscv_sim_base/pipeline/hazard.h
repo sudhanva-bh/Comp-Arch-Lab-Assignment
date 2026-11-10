@@ -18,3 +18,4 @@ HazardVerdict hazard_check(const Pipeline *p, const DecodedInstr *d, const Contr
 Operands      forward_operands(const Pipeline *p, const IDEX *d);
 
 #endif /* HAZARD_H */
+
