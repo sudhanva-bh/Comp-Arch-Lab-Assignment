@@ -1,0 +1,6 @@
+Normal build: -std=c11 -Wall -Wextra -O0
+PASS: 747 checks + C predictor assertions
+Sanitizer build: -O1 -Werror -fsanitize=address,undefined
+PASS: 747 checks + C predictor assertions
+
+Run make test to reproduce checks. See W9_IMPLEMENTATION.md for scope.
