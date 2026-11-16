@@ -100,7 +100,9 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
                      w->fault == PF_FETCH ? "instruction fetch out of bounds" : "memory access out of bounds",
                      w->fault_addr, w->pc);
         } else {
-            if (w->ctrl.reg_write) cpu_write_reg(cpu, w->instr.rd, w->wb_val);
+            if (w->ctrl.reg_write) cpu_write_any(cpu, w->ctrl.dst, w->wb_val);
+            if (w->fcsr_write) cpu->fcsr=w->fcsr_val;
+            if (isa_flags(w->handler)&IF_FP_STATE) cpu->fp_used=1;
             if (w->ctrl.is_system) {
                 CPUState call = *cpu;
                 call.pc = w->pc;
@@ -135,6 +137,7 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
         w.valid = 1; w.pc = e->pc; w.stalled_cycles = e->stalled_cycles; w.fault = e->fault; w.fault_addr = e->fault_addr;
         w.instr = e->instr; w.handler = e->handler; w.ctrl = e->ctrl;
         w.wb_val = e->alu_result; w.syscall_arg = e->store_val;
+        w.fcsr_write=e->fcsr_write; w.fcsr_val=e->fcsr_val;
         if (!w.fault) {
             MemStatus s = MEM_OK;
             if (e->ctrl.mem_read) s = load_value(mem, e->alu_result, e->instr.funct3, &w.wb_val);
@@ -177,6 +180,28 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
                         flush = redirect_pc != d->pred_next;
                     }
                 }
+            } else if (d->ctrl.mem_read || d->ctrl.mem_write) {
+                e.alu_result=o.a+(uint32_t)d->instr.imm;
+            } else if (d->ctrl.is_handler) {
+                CPUState scratch=*cpu;
+                scratch.pc=d->pc;
+                /* Forward the most recent older fcsr effect, but commit only
+                   in WB. Younger flags cannot escape an older precise fault. */
+                if(p->mem_wb.valid && !p->mem_wb.fault && p->mem_wb.fcsr_write)
+                    scratch.fcsr=p->mem_wb.fcsr_val;
+                if(p->ex_mem.valid && !p->ex_mem.fault && p->ex_mem.fcsr_write)
+                    scratch.fcsr=p->ex_mem.fcsr_val;
+                cpu_write_any(&scratch,d->ctrl.src1,o.a);
+                cpu_write_any(&scratch,d->ctrl.src2,o.b);
+                cpu_write_any(&scratch,d->ctrl.src3,o.c);
+                DecodedInstr instr=d->instr;
+                d->handler->execute(&scratch,mem,&instr);
+                if(scratch.status!=CPU_RUNNING) {
+                    e.fault=PF_ILLEGAL;e.fault_addr=d->pc;
+                } else {
+                    e.alu_result=cpu_read_any(&scratch,d->ctrl.dst);
+                    e.fcsr_write=(isa_flags(d->handler)&IF_FP_STATE)!=0;e.fcsr_val=scratch.fcsr;
+                }
             } else if (d->ctrl.is_system) {
                 e.alu_result = o.a;
             } else {
@@ -200,14 +225,16 @@ CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
             if (d.ctrl.is_system && p->reference_timing) {
                 d.ctrl.uses_rs1 = d.ctrl.uses_rs2 = 1;
                 d.instr.rs1 = 17; d.instr.rs2 = 10;
+                d.ctrl.src1=17; d.ctrl.src2=10;
             }
             HazardVerdict hz = hazard_check(p, &d.instr, &d.ctrl);
             if (hz.stall) {
                 stall = 1; nx.stalls++; nx.load_use_stalls += hz.load_use;
                 nx.if_id = p->if_id; nx.if_id.stalled_cycles++;
             } else {
-                d.rs1_val = cpu_read_reg(cpu, d.instr.rs1);
-                d.rs2_val = cpu_read_reg(cpu, d.instr.rs2);
+                d.rs1_val = cpu_read_any(cpu, d.ctrl.src1);
+                d.rs2_val = cpu_read_any(cpu, d.ctrl.src2);
+                d.rs3_val = cpu_read_any(cpu,d.ctrl.src3);
             }
         }
         if (!stall) nx.id_ex = d;
@@ -250,7 +277,7 @@ void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cy
         printf("predictor: name=%s branches=%" PRIu64 " mispredicts=%" PRIu64
                " accuracy=%.1f jal=%" PRIu64 " jalr=%" PRIu64 " redirects=%" PRIu64
                " squashed=%" PRIu64 "\n", p->predictor->name, p->branches, p->mispredicts,
-               p->branches ? 100.0 * (p->branches - p->mispredicts) / p->branches : 0.0,
+               p->branches ? 100.0 * (p->branches - p->mispredicts) / p->branches : 100.0,
                p->jal, p->jalr, p->flushes, 2 * p->flushes);
     }
     if (cpu->status == CPU_RUNNING)

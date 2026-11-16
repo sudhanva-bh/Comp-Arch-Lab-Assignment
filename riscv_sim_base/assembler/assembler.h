@@ -31,4 +31,6 @@ typedef struct {
  * extension -- is automatically assemblable without touching this file. */
 AsmStatus assemble_file(const char *filename, Memory *mem, uint32_t *out_entry_point, AsmError *err);
 
+/* Features of the last successfully assembled input; no filename inference. */
+int assembler_uses_fp(void);
 #endif /* ASSEMBLER_H */

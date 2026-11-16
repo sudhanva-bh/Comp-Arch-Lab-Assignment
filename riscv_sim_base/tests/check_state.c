@@ -4,11 +4,14 @@
 #include "executor.h"
 #include "pipeline_state.h"
 #include "rv32i_base.h"
+#include "rv32f.h"
+#include "rv32m.h"
+#include "zicsr.h"
 #include <stdio.h>
 #include <string.h>
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
-    isa_registry_init(); register_rv32i_base();
+    isa_registry_init(); register_rv32i_base(); register_rv32m(); register_zicsr(); register_rv32f();
     Memory original;
     if (memory_init(&original, 1u << 20)) return 2;
     uint32_t entry; AsmError err;
@@ -31,7 +34,8 @@ int main(int argc, char **argv) {
             pipeline_set_predictor(&p, predictors[(mode - 4) / 2]);
         }
         while (cpu.status == CPU_RUNNING && p.cycles < 100000) pipeline_cycle(&p, &cpu, &mem);
-        int bad = cpu.status != oracle.status || memcmp(cpu.regs, oracle.regs, sizeof(cpu.regs)) ||
+        int bad = cpu.status != oracle.status || cpu.fcsr!=oracle.fcsr ||
+                  memcmp(cpu.fregs,oracle.fregs,sizeof(cpu.fregs)) || memcmp(cpu.regs, oracle.regs, sizeof(cpu.regs)) ||
                   memcmp(mem.data, ref.data, mem.size);
         if (cpu.status == CPU_MEM_FAULT || cpu.status == CPU_ILLEGAL_INSTRUCTION)
             bad |= cpu.fault_addr != oracle.fault_addr;

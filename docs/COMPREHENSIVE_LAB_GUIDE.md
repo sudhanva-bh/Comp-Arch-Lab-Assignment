@@ -1,8 +1,7 @@
 # Comprehensive Lab Guide
 
 This manual explains the implemented C code in `riscv_sim_base/`. Lab numbers
-follow the sheets: Lab 1=W6, Lab 2=W7, Lab 3=W8, Lab 4=W9. Lab 5=W10 is a design
-specification only. Use [tutorial.md](tutorial.md) for executable commands.
+follow the sheets: Lab 1=W6, Lab 2=W7, Lab 3=W8, Lab 4=W9. Lab 5=W10 is implemented, including its reconstructed starter infrastructure. Use [tutorial.md](tutorial.md) for executable commands.
 
 ## 1. The simulation boundary
 
@@ -22,7 +21,8 @@ Timing correctness is judged within the selected sheet or reference model.
 ### CPU state and register semantics
 
 `core/cpu_state.h` defines `CPUState`: `regs[32]`, `pc`, `next_pc`, `status`,
-`cycle_count`, `fault_addr` and `fault_msg`. `cpu_reset` clears state and chooses
+`cycle_count`, `fault_addr` and `fault_msg`, plus raw-bit `fregs[32]`,
+`fcsr` and FP-display activity state. `cpu_reset` clears state and chooses
 the assembled entry point. `cpu_read_reg` returns zero for x0, and
 `cpu_write_reg` discards writes to it. Handlers use these accessors instead of
 reimplementing the zero rule. ABI names such as t0=x5 and a7=x17 are aliases,
@@ -61,12 +61,13 @@ Assembly mnemonic --> registry lookup --> encoder --> memory word
 Word --> decoder --> registry handler --> ExecuteFn(cpu, mem, instr)
 ```
 
-The original executor calls a handler directly. The present pipeline handles
-ALU/control/memory operations explicitly using decoded controls; only system
-handling invokes the registered execution handler at WB. Thus adding an arbitrary
-new registry entry alone does not automatically add its semantics to this
-pipeline. W10 needs the extra metadata and execution infrastructure described
-later. The registry is extensible, but support across all engines must be checked.
+The original executor calls a handler directly. The pipeline retains explicit
+base ALU/memory/control handling and now invokes registered FP/CSR/M handlers on
+a scratch CPU state for metadata-selected extended operations. Parallel registry
+metadata preserves the base six-field handler initializers while adding operand
+register files, rounding-mode and fixed-rs2 selection. Adding an instruction still
+requires a supported format, metadata and execution behavior in every engine;
+registration alone cannot supply new formats or memory semantics.
 
 ### Two-pass assembler
 
@@ -288,7 +289,7 @@ coincidence. Accuracy is conditional prediction accuracy only.
 
 Counters: `branches` counts resolved conditionals; `jal` and `jalr` count resolved
 jumps; `flushes` is reported as W9 `redirects`; `squashed=2*redirects` is the
-reference's nominal discarded-slot count. No-branch runs report accuracy 0.0
+reference's nominal discarded-slot count. No-branch runs report accuracy 100.0 by convention, matching the W10 goldens,
 rather than divide by zero. The pipeline summary separately prints stalls,
 load-use stalls and EX/MEM vs MEM/WB operand forwards.
 
@@ -324,7 +325,7 @@ scope: b3_applied has 191, costing 382 control cycles even with perfect directio
 
 ## 7. Verification architecture
 
-`make test` first builds `pipeline_checks` and `predictor_checks`. The Python
+`make test` builds `pipeline_checks`, `predictor_checks` and `fp_checks`. The Python
 harness reports 747 checks of goldens, values, output, timing, limits, traces and
 CLI behavior. `check_state.c` independently compares all integer registers and
 every memory byte with a separately assembled single-cycle run. It covers both
@@ -337,59 +338,83 @@ Independent supplied goldens guard against shared-oracle bugs. The suite matches
 all implemented sample golden expectations, including intentionally faulty
 no-hazard results; 100% tested safe-mode oracle agreement is not an exhaustive ISA
 proof. Original t1–t4 W9 and sample3/sample4 W7/W8 sources were absent, so their
-specific sheet rows are not claimed as measured. The supplied 12 executable
-samples are used instead. FP fixtures remain excluded. Sanitizers passed; native
-MSVC and RARS were not run in this environment.
+specific sheet rows are not claimed as measured. The 12 supplied integer samples cover those earlier labs. FP samples run in a
+second W10 suite (9025 checks, including 8875 independent exact-rational cases)
+plus C numerical/encoding assertions. All 15 supplied samples execute. Sanitizers
+passed; native MSVC and RARS were not run in this environment.
 
-## 8. Lab 5 specification: infrastructure before RV32F handlers
+## 8. Lab 5: reconstructed RV32F infrastructure
 
-The W10 sheet assumes infrastructure that is absent from this W9 code. Its
-one-new-ISA-file assignment only applies after that starter infrastructure exists.
-No `fp_helpers.c`, `zicsr.c`, `rv32f.c`, FP register file or FP pipeline is currently
-implemented. A staged plan is:
+The W10 starter infrastructure has now been built. `core/cpu_state.*` contains
+raw-bit fregs[32] and fcsr. All FP registers, including f0, are writable.
+`cpu_read_any`/`cpu_write_any` accept unified register IDs: integer x1–x31 use
+1–31, f0–f31 use 32–63, and dependency ID 0 represents integer zero/no dependency.
+Integer and FP registers with the same numeric index never alias.
 
-1. Extend CPUState with raw-bit `fregs[32]` and `fcsr`; f0 is writable. Add register
-   accessors, reset/display and sticky flag helpers.
-2. Extend the registry with operand-file metadata, rounding-mode fields, fixed-rs2
-   matching and formats for two-source, three-source and CSR operations. Decode
-   `rs3` and CSR numbers; preserve legacy registrations.
-3. Teach the assembler f0–f31/ABI names, `.float`, FP pseudo-ops, optional static
-   rounding modes and CSR forms.
-4. Map integer and FP sources to unified dependency identifiers: integer x1–x31
-   use 1–31, FP f0–f31 use 32–63, while x0 becomes REG_NONE for dependency checks.
-   Do not suppress writes to f0 by reusing the integer zero rule. Add `src3/fwd3`
-   and a captured/forwarded third operand for fused multiply-adds.
-5. Extend pipeline execution so registered FP handlers operate with latched or
-   forwarded inputs and produce the correct destination file at WB. Make flw/fsw
-   use integer address bases and FP data sources/destinations.
-6. Implement and independently verify numerical helpers and the six CSR forms:
-   csrrw/csrrs/csrrc and their immediate variants. Read/write fflags, frm and fcsr.
-7. Implement the 26 instructions listed below and register them. Re-run integer
-   regressions before validating FP values, flags and timing.
+The registry retains parallel operand metadata (IF_RD_FP/IF_RS1_FP/IF_RS2_FP/
+IF_RS3_FP, IF_HAS_RM, IF_RS2_FIXED and handler/FP-state flags). FMT_R2, FMT_R4 and
+FMT_CSR extend format support. The decoder checks fixed-rs2 encodings and R4
+single-precision format bits. The assembler validates the operand register file,
+rounding names, CSR immediate bounds and optional rounding operands, and supports
+`.float` and FP/CSR pseudo-ops. Its feature metadata selects the W10 default
+pipeline only for programs actually containing FP/CSR instructions.
+
+`ControlSignals.src1/src2/src3/dst` carry unified dependency IDs. IDEX captures
+three operand values; forwarding applies EX/MEM priority to each. Immediate
+flw-to-use stalls once even when the consumer uses its third operand. Loads and
+stores use integer address bases but FP destinations/store data. Generic EX
+execution populates a scratch CPUState from captured/forwarded operands, calls
+the registry handler, and latches its destination result for WB.
+
+### Numerical helpers
+
+`isa/fp_helpers.c` resolves rounding and adapts a pinned vendored Berkeley
+SoftFloat binary32 subset using the RISCV specialization. It uses exact integer
+software arithmetic for RNE/RTZ/RDN/RUP/RMM, single-round FMA, canonical NaNs,
+conversion saturation and after-rounding tininess. Backend TLS rounding/flags are
+saved/restored per call. The numerical backend is compiled locally from source;
+it does not use host-fenv approximations. .float literal parsing requires a
+binary32 host float and copies its bits with memcpy, enforced by a static assert.
+
+`isa/rv32f.c` implements:
 
 | Group | Instructions |
 |---|---|
-| Raw bits / classification (8) | flw, fsw, fsgnj.s, fsgnjn.s, fsgnjx.s, fmv.x.w, fmv.w.x, fclass.s |
-| Arithmetic / fused (9) | fadd.s, fsub.s, fmul.s, fdiv.s, fsqrt.s, fmadd.s, fmsub.s, fnmsub.s, fnmadd.s |
-| Compare / min-max / convert (9) | feq.s, flt.s, fle.s, fmin.s, fmax.s, fcvt.w.s, fcvt.wu.s, fcvt.s.w, fcvt.s.wu |
+| Bits/classify (8) | flw, fsw, fsgnj.s, fsgnjn.s, fsgnjx.s, fmv.x.w, fmv.w.x, fclass.s |
+| Arithmetic/fused (9) | fadd.s, fsub.s, fmul.s, fdiv.s, fsqrt.s, fmadd.s, fmsub.s, fnmsub.s, fnmadd.s |
+| Compare/min-max/convert (9) | feq.s, flt.s, fle.s, fmin.s, fmax.s, fcvt.w.s, fcvt.wu.s, fcvt.s.w, fcvt.s.wu |
 
-Binary32 is sign:1, exponent:8, fraction:23. Preserve raw bits with memcpy-based
-conversion helpers, not pointer punning. Canonical arithmetic NaN is 0x7fc00000;
-bit-moving/sign operations preserve payloads. Distinguish quiet and signalling
-NaNs, signed zeros, exact subnormals and inexact underflow. Float-to-integer
-conversion must range-check and saturate before casting to avoid undefined C
-behavior. Fused operations round once, not after separate multiplication/addition.
+Binary32 uses 1 sign, 8 exponent and 23 fraction bits. Arithmetic NaNs canonicalize
+to 0x7fc00000; bit operations preserve payloads and raise no numerical flags.
+feq is quiet for quiet NaNs, whereas flt/fle signal on any NaN. fmin/fmax ignore
+one NaN, canonicalize two, flag signalling NaNs, and order -0/+0 explicitly.
+Out-of-range float-to-integer conversion saturates with NV alone, avoiding
+undefined C casts. Fused instructions round the entire expression once.
 
-`fcsr` holds sticky flags NX, UF, OF, DZ, NV in bits 0–4 and frm in bits 7:5.
-Support RNE, RTZ, RDN, RUP, RMM, plus dynamic mode using frm. Invalid rounding
-encodings must fault before writing flags or a destination. RMM has no direct
-host fenv equivalent; numerical helpers need careful tie handling. Host arithmetic
-alone is insufficient to establish RISC-V NaN/flag/rounding correctness.
+### fcsr and precision
 
-The sheet plans fcsr updates at EX in order, with CSR accesses in the same stage;
-that can avoid a separate fcsr bypass. The implementation must still guarantee
-that an older fault or terminal instruction cannot leave a younger irreversible
-fcsr update visible. This is an invariant to establish, not a property supplied
-by today's integer-only pipeline. The W10 sheet also assumes an RV32M module;
-that module is absent and should be supplied or implemented if required by the
-chosen future FP programs. No M-extension implementation is claimed here.
+fcsr holds NX/UF/OF/DZ/NV in bits 0–4 and frm in bits 7:5. Rounding encodings are
+0=RNE, 1=RTZ, 2=RDN, 3=RUP, 4=RMM, 7=dynamic. Static 5/6 and dynamic frm>4 fault
+before destination/flag writes. `isa/zicsr.c` provides six CSR forms, restricted
+to fflags (1), frm (2) and fcsr (3). Unknown CSRs fault precisely.
+
+Handlers calculate a next fcsr in EX, using the newest older staged EX/MEM or
+MEM/WB update, but architectural fcsr commits only at WB. This preserves in-order
+CSR/rounding visibility without stalls and prevents a younger instruction from
+leaving flags after an older fault or exit. It deliberately strengthens the
+sheet's direct-EX state update while matching all supplied timing figures.
+
+The assumed RV32M starter is also reconstructed in `isa/rv32m.c`, including
+multiply-high variants, zero-divisor behavior and INT_MIN/-1 division handling.
+M handlers use the registry scratch-execution path without activating FP state.
+
+### Measured validation
+
+The supplied FP sample forward/stall counts are f1=46/61, f2=71/90, f3=222/449.
+All eight available goldens match x/f bits, fcsr, program output, status and
+counters; f2's stalling case is oracle-checked because no golden was supplied.
+The W10 suite uses 8875 independent Fraction/integer rounding vectors, directed
+numerical/encoding assertions and fourteen full-state regression programs. The
+original 747 checks also pass. See
+[W10_IMPLEMENTATION.md](riscv_sim_base/W10_IMPLEMENTATION.md) for provenance,
+measured tables, behavior differences from the missing starter, and limitations.

@@ -12,6 +12,8 @@ static const char *abi_names[NUM_REGS] = {
 
 void cpu_reset(CPUState *cpu, uint32_t start_pc) {
     memset(cpu->regs, 0, sizeof(cpu->regs));
+    memset(cpu->fregs, 0, sizeof(cpu->fregs));
+    cpu->fcsr = 0; cpu->fp_used = 0;
     cpu->pc = start_pc;
     cpu->next_pc = start_pc;
     cpu->status = CPU_RUNNING;
@@ -61,4 +63,30 @@ const char *cpu_status_str(CPUStatus status) {
         case CPU_ECALL_EXIT:            return "ECALL_EXIT";
         default:                        return "UNKNOWN";
     }
+}
+
+static const char *fp_names[32] = {
+    "ft0","ft1","ft2","ft3","ft4","ft5","ft6","ft7","fs0","fs1",
+    "fa0","fa1","fa2","fa3","fa4","fa5","fa6","fa7","fs2","fs3","fs4","fs5",
+    "fs6","fs7","fs8","fs9","fs10","fs11","ft8","ft9","ft10","ft11"
+};
+uint32_t cpu_read_freg(const CPUState *c, int i) { return c->fregs[i & 31]; }
+void cpu_write_freg(CPUState *c, int i, uint32_t v) { c->fregs[i & 31]=v; c->fp_used=1; }
+void cpu_raise_fflags(CPUState *c, uint32_t f) { c->fcsr |= f & 31; c->fp_used=1; }
+uint32_t cpu_frm(const CPUState *c) { return (c->fcsr >> 5) & 7; }
+const char *cpu_freg_abi_name(int i) { return fp_names[i & 31]; }
+int cpu_freg_index_from_name(const char *name) {
+    if (!name) return -1;
+    if ((name[0]=='f' || name[0]=='F') && isdigit((unsigned char)name[1])) {
+        char *end; long i=strtol(name+1,&end,10);
+        if (!*end && i>=0 && i<32) return (int)i;
+    }
+    for (int i=0;i<32;i++) if (!strcmp(name,fp_names[i])) return i;
+    return -1;
+}
+uint32_t cpu_read_any(const CPUState *c, unsigned r) {
+    return r>=32 ? cpu_read_freg(c,(int)r-32) : cpu_read_reg(c,(int)r);
+}
+void cpu_write_any(CPUState *c, unsigned r, uint32_t v) {
+    if (r>=32) cpu_write_freg(c,(int)r-32,v); else cpu_write_reg(c,(int)r,v);
 }

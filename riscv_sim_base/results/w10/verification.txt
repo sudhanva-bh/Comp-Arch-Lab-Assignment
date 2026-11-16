@@ -1,0 +1,9 @@
+W10 release verification
+747 legacy checks + 9025 W10 checks = 9772 Python checks
+Plus C predictor and directed FP/M assertions
+8875 independent exact-rational numerical vectors
+14 FP/CSR/M architectural regressions, 12 safe configurations
+Normal GCC C11 -Wall -Wextra -O0: PASS, no warnings
+GCC -O1 -Werror -fsanitize=address,undefined: PASS
+All 8 supplied W10 golden runs match values, fcsr, output and counters
+RARS and native Windows not run

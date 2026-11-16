@@ -1,6 +1,6 @@
 CC      := gcc
-CFLAGS  := -MMD -MP -std=c11 -Wall -Wextra -g -O0 \
-           -Icore -Iisa -Iassembler -Iui -Ipipeline
+CFLAGS  := -MMD -MP -std=c11 -Wall -Wextra -g -O0
+CPPFLAGS := -Icore -Iisa -Iassembler -Iui -Ipipeline -Ivendor/softfloat/include -Ivendor/softfloat -Ivendor/softfloat/RISCV -DSOFTFLOAT_FAST_INT64 -DINLINE_LEVEL=0
 LDFLAGS :=
 
 BIN := rvsim
@@ -12,6 +12,10 @@ SRCS := \
 	core/decoder.c \
 	core/executor.c \
 	isa/rv32i_base.c \
+	isa/fp_helpers.c \
+	isa/rv32f.c \
+	isa/rv32m.c \
+	isa/zicsr.c \
 	assembler/assembler.c \
 	ui/cli_display.c \
 	pipeline/branch_predictor.c \
@@ -22,8 +26,9 @@ SRCS := \
 	pipeline/pipeline.c \
 	main.c
 
+SRCS += $(wildcard vendor/softfloat/source/*.c) $(wildcard vendor/softfloat/RISCV/*.c)
 OBJS := $(SRCS:.c=.o)
-DEPS := $(OBJS:.o=.d) tests/pipeline_checks.d tests/predictor_checks.d
+DEPS := $(OBJS:.o=.d) tests/pipeline_checks.d tests/predictor_checks.d tests/fp_checks.d
 
 -include $(DEPS)
 .DEFAULT_GOAL := all
@@ -33,10 +38,13 @@ DEPS := $(OBJS:.o=.d) tests/pipeline_checks.d tests/predictor_checks.d
 all: $(BIN)
 
 $(BIN): $(OBJS)
-	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+# Upstream specialization declares unused parameters in generic NaN helpers.
+vendor/softfloat/%.o: override CFLAGS += -Wno-unused-parameter -Wno-unused-label
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 # Example: make run PROG=tests/sample1.s
 run: $(BIN)
@@ -49,14 +57,19 @@ memcheck: $(BIN)
 # Regression suite checks the oracle, lab-sheet timing, supplied goldens,
 # and full architectural state (including memory on faults and exit).
 tests/pipeline_checks: tests/check_state.c $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
 
 tests/predictor_checks: tests/check_predictor.c $(filter-out main.o,$(OBJS))
-	$(CC) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
 
-test: $(BIN) tests/pipeline_checks tests/predictor_checks
+tests/fp_checks: tests/check_fp.c $(filter-out main.o,$(OBJS))
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
+
+test: $(BIN) tests/pipeline_checks tests/predictor_checks tests/fp_checks
 	./tests/predictor_checks
 	python3 tests/run_tests.py
+	./tests/fp_checks
+	python3 tests/run_fp_tests.py
 
 clean:
-	rm -f $(OBJS) $(DEPS) $(BIN) tests/pipeline_checks tests/predictor_checks
+	rm -f $(OBJS) $(DEPS) $(BIN) tests/pipeline_checks tests/predictor_checks tests/fp_checks

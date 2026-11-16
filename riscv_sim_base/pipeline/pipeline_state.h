@@ -7,17 +7,19 @@ typedef struct { int valid; uint32_t pc, raw, pred_next; int fault; uint64_t sta
 typedef struct {
     int valid; uint32_t pc; int fault; uint64_t stalled_cycles;
     DecodedInstr instr; const InstructionHandler *handler; ControlSignals ctrl;
-    uint32_t rs1_val, rs2_val, pred_next;
+    uint32_t rs1_val, rs2_val, rs3_val, pred_next;
 } IDEX;
 typedef struct {
     int valid; uint32_t pc; int fault; uint64_t stalled_cycles;
     DecodedInstr instr; const InstructionHandler *handler; ControlSignals ctrl;
     uint32_t alu_result, store_val, fault_addr;
+    int fcsr_write; uint32_t fcsr_val;
 } EXMEM;
 typedef struct {
     int valid; uint32_t pc; int fault; uint64_t stalled_cycles;
     DecodedInstr instr; const InstructionHandler *handler; ControlSignals ctrl;
     uint32_t wb_val, fault_addr, syscall_arg;
+    int fcsr_write; uint32_t fcsr_val;
 } MEMWB;
 typedef struct {
     IFID if_id; IDEX id_ex; EXMEM ex_mem; MEMWB mem_wb;

@@ -25,15 +25,18 @@ The sum program prints `55`, leaves t1/x6 and a0/x10 at `0x00000037`, and ends:
 status = ECALL_EXIT   cycles = 53
 ```
 
-`make test` builds both verifier binaries and finishes with:
+`make test` builds all three verifier binaries and reports:
 
 ```text
 PASS: 747 checks; W6-W9 goldens, counters, full architectural state, faults, limits, traces
+PASS: FP/RV32M directed numerical and encoding assertions
+PASS: 9025 W10 checks, including 8875 independent exact-rational rounding vectors
 ```
 
 It also runs the C predictor assertions. Build commands and `make` directory
-messages may precede this line. To rerun the Python portion after a successful
-build, use `python3 tests/run_tests.py`. Python alone does not build its binaries.
+messages may precede these lines. After a successful build, run
+`python3 tests/run_tests.py` for the legacy suite or `python3 tests/run_fp_tests.py`
+for W10. Python alone does not build its binaries.
 
 ### Windows / PowerShell / MSVC
 
@@ -42,9 +45,11 @@ installed, and change to the extracted repository root. Build from source:
 
 ```powershell
 Set-Location riscv_sim_base
-$sources = Get-ChildItem core,isa,assembler,ui,pipeline -Filter *.c |
+$sources = Get-ChildItem core,isa,assembler,ui,pipeline,vendor/softfloat/source,vendor/softfloat/RISCV -Filter *.c |
     ForEach-Object { $_.FullName }
-$includes = @('/Icore','/Iisa','/Iassembler','/Iui','/Ipipeline')
+$includes = @('/Icore','/Iisa','/Iassembler','/Iui','/Ipipeline',
+    '/Ivendor/softfloat/include','/Ivendor/softfloat','/Ivendor/softfloat/RISCV',
+    '/DSOFTFLOAT_FAST_INT64','/DINLINE_LEVEL=0')
 cl /nologo /std:c11 /W4 /D_CRT_SECURE_NO_WARNINGS $includes $sources main.c /Fe:rvsim.exe
 if ($LASTEXITCODE -ne 0) { throw 'Simulator build failed' }
 .\rvsim.exe tests\sample1_sum_loop.s --single-cycle
@@ -63,7 +68,11 @@ cl /nologo /std:c11 /W4 /D_CRT_SECURE_NO_WARNINGS $includes $sources tests\check
 if ($LASTEXITCODE -ne 0) { throw 'Predictor verifier build failed' }
 .\tests\predictor_checks.exe
 if ($LASTEXITCODE -ne 0) { throw 'Predictor assertions failed' }
+cl /nologo /std:c11 /W4 /D_CRT_SECURE_NO_WARNINGS $includes $sources tests\check_fp.c /Fe:tests\fp_checks.exe
+if ($LASTEXITCODE -ne 0) { throw 'FP verifier build failed' }
 python tests\run_tests.py
+.\tests\fp_checks.exe
+python tests\run_fp_tests.py
 ```
 
 Use a Python 3 installation accessible as `python`; use `py -3` instead if that
@@ -85,12 +94,12 @@ There is no `tests/run_tests.sh` in this implementation.
 | `tests/given/lab2_pipeline` | p1_broad, p2_edge, p3_kernel | Reference no-hazard pipeline fixtures with scheduled spacing |
 | `tests/given/lab3_hazards` | h1_broad, h2_edge, h3_kernel | Compare reference stall/forward; none is intentionally wrong |
 | `tests/given/lab4_branch` | b1_patterns, b2_adversarial, b3_applied | All four predictors plus oracle |
-| `tests/given/lab5_fp` | f1_broad, f2_special, f3_kernel | Reference-only until W10 is implemented |
+| `tests/given/lab5_fp` | f1_broad, f2_special, f3_kernel | Executable W10 FP/CSR samples |
 
 All program names above end in `.s`. Labs 2–5 have `expected/` files containing
-reference output. Only the 12 W6–W9 programs run in today's suite; all 15 are
-listed in the benchmark matrix below. W10 assembly will currently be rejected,
-not simulated successfully.
+reference output. All 15 supplied samples now run. `run_tests.py` covers the
+legacy W6–W9 suite; `run_fp_tests.py` covers W10, exact numerical vectors and
+FP/CSR/M regression programs. `make test` builds dependencies and runs both.
 
 ## 3. Lab 1 / W6: establish the baseline
 
@@ -296,8 +305,7 @@ changing this direction predictor. Do not attribute all control cycles to misses
 ## 7. Master matrix: all 15 supplied sample programs
 
 The RARS column below is **supplied reference data, not measured here**. Current
-oracle and selected pipeline counts for s*/p*/h*/b* have been checked. FP rows
-are **future reference targets only**. The selected pipeline is basic for p*,
+oracle and selected pipeline counts for all 15 programs have been checked. The selected pipeline is basic for p*,
 reference-forward for h*, and reference-forward+2bit for b*. A dash means the
 original cross-lab reference table did not assign a pipeline figure, not that
 the current safe pipeline cannot run that integer sample.
@@ -316,15 +324,15 @@ the current safe pipeline cannot run that integer sample.
 | b1_patterns | lab4_branch | 703233 | 1329 | 1330 | 1476 | --predictor 2bit |
 | b2_adversarial | lab4_branch | 4078 | 4738 | 4739 | 4985 | --predictor 2bit |
 | b3_applied | lab4_branch | 697645586 | 3194 | 3195 | 3982 | --predictor 2bit |
-| f1_broad | lab5_fp | 11 | 41 | 42* | 46* | W10 pending |
-| f2_special | lab5_fp | 12 | 65 | 66* | 71* | W10 pending |
-| f3_kernel | lab5_fp | 1432536311 | 196 | 197* | 222* | W10 pending |
+| f1_broad | lab5_fp | 11 | 41 | 42 | 46 | --batch (W10 auto forward+2bit) |
+| f2_special | lab5_fp | 12 | 65 | 66 | 71 | --batch (W10 auto forward+2bit) |
+| f3_kernel | lab5_fp | 1432536311 | 196 | 197 | 222 | --batch (W10 auto forward+2bit) |
 
-`*` Reference target for an unimplemented FP engine. These three programs cannot
-currently reproduce those figures. The supplied RARS/oracle counts use different
-counting conventions; do not compare their raw numbers as a host-speed benchmark.
-`Cycles references.md` and the provided expected files are the source of these
-cross-tool figures. The original engine counts exit `ecall` as an instruction.
+For FP/CSR programs, assembler metadata selects the W10 reference pipeline
+(forward+2bit) unless an engine is explicitly selected. Integer-only `--batch`
+stays on the original engine. Use `--single-cycle` explicitly for the FP oracle.
+The supplied RARS/oracle columns use different counting conventions and are not
+host-speed benchmarks. The original engine counts exit `ecall` as an instruction.
 
 To run a single sample, combine its folder/name with its mode, for example:
 
@@ -500,24 +508,116 @@ make test
 
 The final clean/rebuild restores normal binaries: Make does not track changes to
 command-line compiler flags. Clean before switching build configurations.
-The verified sanitizer suite passes the same 747 checks and C assertions.
+The verified sanitizer suite passes all 747 legacy checks, 9025 W10 checks and
+the C predictor/numerical assertions.
 
-## 13. W10: inspect the fixtures, do not claim they pass
+## 13. Lab 5 / W10: floating-point execution and verification
 
-You may read future samples and their expected output:
+**Goal:** run all 26 FP instructions with correct raw register bits, rounding,
+flags, forwarding and precise exceptions. The missing starter files are now
+reconstructed, including FP registers, fcsr/CSR instructions, typed metadata,
+third-operand paths and a pinned vendored numerical backend.
+
+Run each FP sample in all three main configurations:
 
 ```bash
-cat tests/given/lab5_fp/f1_broad.s
-cat tests/given/lab5_fp/expected/f1_broad.forward.out
+for f in tests/given/lab5_fp/*.s; do
+    ./rvsim "$f" --single-cycle
+    ./rvsim "$f" --batch --hazard forward
+    ./rvsim "$f" --batch --hazard stall
+done
 ```
 
 ```powershell
-Get-Content tests\given\lab5_fp\f1_broad.s
-Get-Content tests\given\lab5_fp\expected\f1_broad.forward.out
+Get-ChildItem tests\given\lab5_fp\*.s | ForEach-Object {
+    & .\rvsim.exe $_.FullName --single-cycle
+    & .\rvsim.exe $_.FullName --batch --hazard forward
+    & .\rvsim.exe $_.FullName --batch --hazard stall
+}
 ```
 
-Do not run an all-directories wildcard and interpret rejected FP mnemonics as a
-W6–W9 regression. The harness deliberately excludes `lab5_fp`. Once the FP state,
-CSR and numerical helpers, register metadata, third-operand paths and 26 handlers
-exist, extend verification to x registers, f registers, fcsr, memory and output.
-See [the W10 plan](COMPREHENSIVE_LAB_GUIDE.md#8-lab-5-specification-infrastructure-before-rv32f-handlers).
+FP/CSR metadata selects 2bit prediction automatically for these inputs, so
+`--batch` alone also runs the forwarding W10 pipeline. To state all choices
+explicitly, use `--predictor 2bit --hazard forward`. The legacy explicit engine
+selectors remain available for comparison. FP feature selection does not rely
+on input filenames.
+
+| Program | Prints | Retired | Forward cycles / stalls / forwards | Stall cycles / stalls | Final fcsr |
+|---|---|---:|---|---|---|
+| f1_broad | 11 | 42 | 46 / 0 / 10 | 61 / 15 | 0x01 (NX) |
+| f2_special | 12 | 66 | 71 / 1 / 12 | 90 / 20 | 0x11 (NV, NX) |
+| f3_kernel | 1432536311 | 197 | 222 / 9 / 143 | 449 / 236 | 0x01 (NX) |
+
+f1's forwarding CPI is 1.095; f2's is 1.076; f3's is 1.127. The kernel's
+forwarding reduction is (449-222)/449 = 50.6%. Its cycle identity is
+197+4+9+2×6=222: six mispredicted branches and nine load-use stalls.
+
+After an FP/CSR program, the dump includes f0–f31 raw bits and a numeric fcsr.
+For the kernel, key results include s1=63, s2=64, s3=4029, s4=11 and
+s5=0x41300000. The final lines include:
+
+```text
+fcsr =0x00000001  (frm=0  flags: NX)
+status = ECALL_EXIT   cycles = 222
+pipeline: mode=forward timing=reference cycles=222 retired=197 stalls=9 flushes=6 CPI=1.127 fwd_ex=109 fwd_mem=34 load_use=9 discarded_stalls=0
+predictor: name=2bit branches=12 mispredicts=6 accuracy=50.0 jal=0 jalr=0 redirects=6 squashed=12
+```
+
+A `pc = ...` line occurs between fcsr and status; it is omitted from this excerpt
+because pipeline fetch PC is not an architectural comparison target. Runs with
+no conditional branches report accuracy=100.0 by convention, matching FP goldens.
+
+### Run the numerical tests separately
+
+After `make test` has built dependencies:
+
+```bash
+./tests/fp_checks
+python3 tests/run_fp_tests.py
+./tests/pipeline_checks tests/given/lab5_fp/f3_kernel.s
+```
+
+```powershell
+.\tests\fp_checks.exe
+python tests\run_fp_tests.py
+.\tests\pipeline_checks.exe tests\given\lab5_fp\f3_kernel.s
+```
+
+The W10 harness compares all eight supplied FP golden runs and oracle-checks the
+additional f2 stalling case. It checks x/f registers, fcsr, actual program output,
+status and counters. Numerical verification includes 8875 independent exact
+integer/Fraction calculations over all five rounding modes, including sqrt,
+FMA, division and conversion directions. The backend's own output is not used
+as its independent expected answer.
+
+Fourteen `tests/fp_regression/*.s` programs cover third-source forwarding,
+writable f0, integer/FP register separation, all CSR forms, reserved rounding
+modes, unsupported CSRs, M-extension boundaries and precise flags on faults,
+exit and wrong paths. The architectural C verifier compares fcsr and every RAM
+byte as well as both register files across twelve safe configurations.
+
+### Check invalid rounding and precise flags
+
+```bash
+./rvsim tests/fp_regression/invalid_dynamic_5.s --batch
+./rvsim tests/fp_regression/precise_memory_flags.s --batch
+./rvsim tests/fp_regression/third_operand.s --batch
+```
+
+```powershell
+.\rvsim.exe tests\fp_regression\invalid_dynamic_5.s --batch
+.\rvsim.exe tests\fp_regression\precise_memory_flags.s --batch
+.\rvsim.exe tests\fp_regression\third_operand.s --batch
+```
+
+The first reports ILLEGAL_INSTRUCTION without changing the invalid instruction's
+FP destination or flags. The second reports MEM_FAULT; its earlier NX flag
+survives, but the younger divide's NV flag does not commit. The third exits
+normally with s0=6 and s1=7. These are intentional fault tests, not all required
+to finish with ECALL_EXIT. Check CPU status explicitly.
+
+The backend's source and license are in `vendor/softfloat/`. All build inputs are
+vendored, so a fresh build needs no network. The model still treats FP operations
+as single-cycle EX computations; it does not add a multi-cycle physical FPU or
+privileged CSR platform. See
+[the W10 implementation record](riscv_sim_base/W10_IMPLEMENTATION.md) for details.

@@ -9,6 +9,9 @@
 #include "assembler.h"
 #include "cli_display.h"
 #include "pipeline_state.h"
+#include "rv32f.h"
+#include "rv32m.h"
+#include "zicsr.h"
 
 #define DEFAULT_MEM_SIZE   (1u << 20)   /* 1 MB */
 #define DEFAULT_MAX_CYCLES 1000000ull
@@ -16,7 +19,7 @@
 static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <program.s> [options]\n"
-        "  --batch              run to completion with no interaction, then dump state\n"
+        "  --batch              run batch; FP/CSR inputs default to forward+2bit\n"
         "  --single-cycle       select original batch engine\n"
         "  --pipeline           sheet timing, conservative stalling\n"
         "  --pipeline-forward   sheet timing, forwarding and load-use detection\n"
@@ -94,6 +97,7 @@ int main(int argc, char **argv) {
      *    register_rv32f(), register_custom_ext(), etc. right here. */
     isa_registry_init();
     register_rv32i_base();
+    register_rv32m(); register_zicsr(); register_rv32f();
 
     /* 2. Set up memory and assemble the program into it. */
     Memory mem;
@@ -111,6 +115,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, ": %s\n", err.message);
         memory_free(&mem);
         return 1;
+    }
+
+    /* FP/CSR programs use the W10 starter's default pipeline unless a legacy
+       engine was explicitly selected. Integer-only defaults stay unchanged. */
+    if(assembler_uses_fp() && !explicit_engine && !predictor) {
+        predictor=&bp_2bit; pipeline_mode=batch_mode=reference_timing=1;
+        if(!explicit_hazard)forwarding=1;
     }
 
     printf("assembled '%s' ok. entry point = 0x%08x\n", program_path, entry_point);

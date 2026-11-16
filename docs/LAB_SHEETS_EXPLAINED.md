@@ -2,8 +2,7 @@
 
 No prior knowledge of this codebase is assumed. The five sheets describe one
 progression: first make instruction behavior correct, then overlap instructions,
-then recover the efficiency lost to dependencies and branches. Weeks 6–9 are
-implemented in `riscv_sim_base/`; Week 10 describes the next extension.
+then recover the efficiency lost to dependencies and branches. Weeks 6–10 are implemented in `riscv_sim_base/`.
 
 ## 1. What is a processor simulator?
 
@@ -237,14 +236,14 @@ Dynamic is not automatically better. BTFN has no learning delay and is fastest
 in aggregate on the supplied three W9 samples; two-bit helps some patterns but
 cannot represent every alternating/history-dependent behavior.
 
-## 7. Week 10 / Lab 5: numbers with fractions, still pending
+## 7. Week 10 / Lab 5: numbers with fractions
 
 Integer registers hold whole-number bit patterns. **Floating point** represents
 numbers with a sign, exponent and fraction, trading finite precision for a wide
 range of magnitudes. Binary32 uses 1 sign bit, 8 exponent bits and 23 fraction
 bits; normal values also have an implicit leading significand bit.
 
-The next sheet asks for 26 FP instructions, FP registers, rounding rules and
+This sheet adds 26 FP instructions, FP registers, rounding rules and
 exception flags. A second register file means f0 is a normal writable register,
 unlike x0. Fused multiply-add needs a third source operand and rounds the entire
 multiply-plus-add once, which can differ from two separately rounded operations.
@@ -261,10 +260,18 @@ A status register, fcsr, records rounding mode and sticky NV/DZ/OF/UF/NX flags:
 invalid operation, division by zero, overflow, underflow and inexact result.
 Sticky means a flag remains set until software clears it.
 
-The supplied f1/f2/f3 programs are future reference fixtures, not runnable tests
-yet. This project does not contain the FP registers, CSR instructions, numerical
-helpers or extended pipeline assumed by that sheet. The comprehensive guide
-lists the preparation needed before implementing the handlers.
+The f1/f2/f3 samples now run: they print 11, 12 and 1432536311, respectively.
+The missing FP registers, CSR forms, numerical helpers and third-operand paths
+have been recreated. A vendored software floating-point backend implements exact
+rounding and flags, including the ties-away mode that ordinary host arithmetic
+cannot select directly.
+
+Flags are calculated in EX, forwarded to following FP/CSR instructions, and
+committed at WB. This lets the processor see the correct older rounding/flag
+state while discarding younger effects after a fault or exit. FP and integer
+registers have separate dependency IDs, so f0 is forwarded like any normal
+register while x0 remains constant. The existing hazard principles apply to all
+three inputs of fused multiply-add.
 
 ## 8. How to judge a result
 
