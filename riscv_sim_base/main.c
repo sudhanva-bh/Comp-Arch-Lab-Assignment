@@ -9,7 +9,6 @@
 #include "assembler.h"
 #include "cli_display.h"
 #include "pipeline_state.h"
-#include "branch_predictor.h"
 
 #define DEFAULT_MEM_SIZE   (1u << 20)   /* 1 MB */
 #define DEFAULT_MAX_CYCLES 1000000ull
@@ -18,13 +17,14 @@ static void usage(const char *prog) {
     fprintf(stderr,
         "usage: %s <program.s> [options]\n"
         "  --batch              run to completion with no interaction, then dump state\n"
-        "  --single-cycle       run in single-cycle mode (reference oracle)\n"
-        "  --pipeline           run on five-stage pipeline with stalling only (Lab 2)\n"
-        "  --pipeline-forward   run on five-stage pipeline with data forwarding (Lab 3)\n"
-        "  --predictor <name>   branch predictor: not-taken, btfn, 1bit, 2bit (Lab 4, default 2bit)\n"
-        "  --hazard <mode>      hazard unit: stall or forward (default forward)\n"
-        "  --trace              print cycle-by-cycle pipeline trace\n"
-        "  --max-cycles N       cycle limit for batch/pipeline mode (default %llu)\n"
+        "  --single-cycle       select original batch engine\n"
+        "  --pipeline           sheet timing, conservative stalling\n"
+        "  --pipeline-forward   sheet timing, forwarding and load-use detection\n"
+        "  --hazard POLICY      reference timing: stall, forward, none\n"
+        "  --pipeline-basic     reference timing, no hazards (teaching mode)\n"
+        "  --predictor NAME     W9: not-taken, btfn, 1bit, 2bit (forward by default)\n"
+        "  --trace              pipeline cycle trace to stderr\n"
+        "  --max-cycles N       cycle limit for --batch mode (default %llu)\n"
         "  --mem-size N         memory size in bytes (default %u)\n",
         prog, (unsigned long long)DEFAULT_MAX_CYCLES, DEFAULT_MEM_SIZE);
 }
@@ -36,12 +36,10 @@ int main(int argc, char **argv) {
     }
 
     const char *program_path = argv[1];
-    int batch_mode = 0;
-    int pipeline_mode = 0;
-    int single_cycle_forced = 0;
-    int forwarding = 1; /* default for Lab 4 is forwarding */
-    int trace_mode = 0;
-    const char *predictor_name = NULL;
+    int batch_mode = 0, pipeline_mode = 0, forwarding = 0;
+    int reference_timing = 0, no_hazards = 0, trace = 0;
+    const BranchPredictor *predictor = NULL;
+    int explicit_engine = 0, explicit_hazard = 0;
     uint64_t max_cycles = DEFAULT_MAX_CYCLES;
     uint32_t mem_size = DEFAULT_MEM_SIZE;
 
@@ -49,28 +47,29 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--batch") == 0) {
             batch_mode = 1;
         } else if (strcmp(argv[i], "--single-cycle") == 0) {
-            single_cycle_forced = 1;
-        } else if (strcmp(argv[i], "--pipeline") == 0) {
-            pipeline_mode = 1;
+            pipeline_mode = 0; batch_mode = 1; explicit_engine = 1;
+        } else if (strcmp(argv[i], "--pipeline") == 0 || strcmp(argv[i], "--pipeline-forward") == 0) {
+            pipeline_mode = batch_mode = 1; explicit_engine = 1;
+            forwarding = strcmp(argv[i], "--pipeline-forward") == 0;
+            reference_timing = no_hazards = 0;
+        } else if (strcmp(argv[i], "--pipeline-basic") == 0) {
+            pipeline_mode = batch_mode = reference_timing = no_hazards = 1; explicit_engine = 1;
             forwarding = 0;
-        } else if (strcmp(argv[i], "--pipeline-forward") == 0) {
-            pipeline_mode = 1;
-            forwarding = 1;
-        } else if (strcmp(argv[i], "--predictor") == 0 && i + 1 < argc) {
-            predictor_name = argv[++i];
-            pipeline_mode = 1;
         } else if (strcmp(argv[i], "--hazard") == 0 && i + 1 < argc) {
-            const char *h = argv[++i];
-            if (strcmp(h, "stall") == 0) forwarding = 0;
-            else if (strcmp(h, "forward") == 0) forwarding = 1;
-            else {
-                fprintf(stderr, "unknown hazard mode '%s' (expected 'stall' or 'forward')\n", h);
-                return 1;
+            const char *policy = argv[++i];
+            if (strcmp(policy, "stall") && strcmp(policy, "forward") && strcmp(policy, "none")) {
+                fprintf(stderr, "invalid hazard policy '%s'\n", policy); return 1;
             }
-            pipeline_mode = 1;
+            pipeline_mode = batch_mode = reference_timing = 1; explicit_hazard = 1;
+            forwarding = strcmp(policy, "forward") == 0;
+            no_hazards = strcmp(policy, "none") == 0;
+        } else if (strcmp(argv[i], "--predictor") == 0 && i + 1 < argc) {
+            predictor = bp_find(argv[++i]);
+            if (!predictor) {
+                fprintf(stderr, "invalid predictor '%s'\n", argv[i]); return 1;
+            }
         } else if (strcmp(argv[i], "--trace") == 0) {
-            trace_mode = 1;
-            pipeline_mode = 1;
+            trace = 1;
         } else if (strcmp(argv[i], "--max-cycles") == 0 && i + 1 < argc) {
             max_cycles = strtoull(argv[++i], NULL, 0);
         } else if (strcmp(argv[i], "--mem-size") == 0 && i + 1 < argc) {
@@ -82,21 +81,17 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (single_cycle_forced) {
-        pipeline_mode = 0;
-        batch_mode = 1;
-    }
-
-    const BranchPredictor *pred = NULL;
-    if (predictor_name) {
-        pred = bp_find(predictor_name);
-        if (!pred) {
-            fprintf(stderr, "unknown predictor '%s' (options: not-taken, btfn, 1bit, 2bit)\n", predictor_name);
+    if (predictor) {
+        if (explicit_engine) {
+            fprintf(stderr, "--predictor cannot be combined with an explicit legacy engine\n");
             return 1;
         }
+        pipeline_mode = batch_mode = reference_timing = 1;
+        if (!explicit_hazard) { forwarding = 1; no_hazards = 0; }
     }
 
-    /* 1. Bring up the ISA. */
+    /* 1. Bring up the ISA. Later labs add their own register_rv32m(),
+     *    register_rv32f(), register_custom_ext(), etc. right here. */
     isa_registry_init();
     register_rv32i_base();
 
@@ -125,9 +120,11 @@ int main(int argc, char **argv) {
     cpu_reset(&cpu, entry_point);
 
     if (pipeline_mode) {
-        Pipeline pipe;
-        pipeline_init(&pipe, forwarding, pred, trace_mode);
-        pipeline_run_batch(&pipe, &cpu, &mem, max_cycles);
+        Pipeline p;
+        pipeline_init(&p, forwarding);
+        p.reference_timing = reference_timing; p.no_hazards = no_hazards; p.trace = trace;
+        pipeline_set_predictor(&p, predictor);
+        pipeline_run_batch(&p, &cpu, &mem, max_cycles);
     } else if (batch_mode) {
         run_batch(&cpu, &mem, max_cycles);
     } else {

@@ -1,21 +1,9 @@
 #include "branch_predictor.h"
 #include <string.h>
-
-static const BranchPredictor *predictors[] = {
-    &bp_not_taken,
-    &bp_btfn,
-    &bp_1bit,
-    &bp_2bit,
-    NULL
-};
-
 const BranchPredictor *bp_find(const char *name) {
-    if (!name) return &bp_2bit; /* default */
-    for (int i = 0; predictors[i]; i++) {
-        if (strcmp(predictors[i]->name, name) == 0) {
-            return predictors[i];
-        }
-    }
+    const BranchPredictor *all[] = {&bp_not_taken, &bp_btfn, &bp_1bit, &bp_2bit};
+    if (!name) return NULL;
+    for (unsigned i = 0; i < sizeof(all)/sizeof(all[0]); i++)
+        if (strcmp(name, all[i]->name) == 0) return all[i];
     return NULL;
 }
-

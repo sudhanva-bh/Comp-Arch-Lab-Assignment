@@ -292,7 +292,8 @@ static uint32_t encode_instruction(const InstructionHandler *h, Fields f) {
 /* ------------------------------------------------------------------ */
 /* Pseudo-instructions                                                */
 /* ------------------------------------------------------------------ */
-/* Kept deliberately minimal. "li" always expands to exactly two real
+/* In the flat address space, "la" uses the absolute "li" expansion.
+ * Kept deliberately minimal. "li" always expands to exactly two real
  * instructions (lui + addi) regardless of the value's magnitude -- this
  * keeps its size fixed and known during pass 1, at the cost of occasionally
  * emitting a redundant lui for small constants. */
@@ -354,7 +355,7 @@ static int assemble_pseudo(const char *mnemonic, char *operand_str, SymbolTable 
         return ASM_OK;
     }
     if (strcmp(mnemonic, "li") == 0 || strcmp(mnemonic, "la") == 0) {
-        if (n != 2) return set_err(err, lineno, ASM_ERR_SYNTAX, "expected 'li/la rd, imm/label'");
+        if (n != 2) return set_err(err, lineno, ASM_ERR_SYNTAX, "expected 'li rd, imm'");
         uint32_t rd;
         if (parse_register(tok[0], &rd, err, lineno) != ASM_OK) return ASM_ERR_BAD_OPERAND;
         int32_t value;

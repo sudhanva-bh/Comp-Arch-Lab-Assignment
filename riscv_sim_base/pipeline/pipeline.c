@@ -2,459 +2,257 @@
 #include "hazard.h"
 #include "decoder.h"
 #include "cli_display.h"
-#include "branch_predictor.h"
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
-void pipeline_init(Pipeline *p, int forwarding, const BranchPredictor *predictor, int trace_mode) {
+void pipeline_init(Pipeline *p, int forwarding) {
     memset(p, 0, sizeof(*p));
     p->forwarding = forwarding;
-    p->trace_mode = trace_mode;
-    p->predictor  = predictor;
-    if (p->predictor && p->predictor->reset) {
-        p->predictor->reset(&p->bp_state);
+}
+
+void pipeline_set_predictor(Pipeline *p, const BranchPredictor *predictor) {
+    p->predictor = predictor;
+    if (predictor) {
+        predictor->reset(&p->bp);
+        p->reference_timing = 1;
     }
 }
 
 static uint32_t alu(const DecodedInstr *i, uint32_t pc, uint32_t a, uint32_t b) {
-    uint32_t opcode = i->opcode;
-    uint32_t funct3 = i->funct3;
-    uint32_t funct7 = i->funct7;
-    int32_t imm = i->imm;
-
-    if (opcode == 0x37) { /* lui */
-        return (uint32_t)imm;
-    }
-    if (opcode == 0x17) { /* auipc */
-        return pc + (uint32_t)imm;
-    }
-    if (opcode == 0x03 || opcode == 0x23) { /* loads and stores: effective address */
-        return a + (uint32_t)imm;
-    }
-    if (opcode == 0x13) { /* I-type arithmetic */
-        switch (funct3) {
-            case 0x0: return a + (uint32_t)imm;                     /* addi */
-            case 0x2: return ((int32_t)a < (int32_t)imm) ? 1 : 0;  /* slti */
-            case 0x3: return (a < (uint32_t)imm) ? 1 : 0;          /* sltiu */
-            case 0x4: return a ^ (uint32_t)imm;                     /* xori */
-            case 0x6: return a | (uint32_t)imm;                     /* ori */
-            case 0x7: return a & (uint32_t)imm;                     /* andi */
-            case 0x1: return a << (imm & 0x1F);                     /* slli */
-            case 0x5:
-                if (funct7 & 0x20) {
-                    return (uint32_t)((int32_t)a >> (imm & 0x1F)); /* srai */
-                } else {
-                    return a >> (imm & 0x1F);                      /* srli */
-                }
-            default: return 0;
-        }
-    }
-    if (opcode == 0x33) { /* R-type arithmetic */
-        uint32_t shamt = b & 0x1F;
-        switch (funct3) {
-            case 0x0:
-                if (funct7 & 0x20) {
-                    return a - b;                                  /* sub */
-                } else {
-                    return a + b;                                  /* add */
-                }
-            case 0x1: return a << shamt;                            /* sll */
-            case 0x2: return ((int32_t)a < (int32_t)b) ? 1 : 0;    /* slt */
-            case 0x3: return (a < b) ? 1 : 0;                      /* sltu */
-            case 0x4: return a ^ b;                                 /* xor */
-            case 0x5:
-                if (funct7 & 0x20) {
-                    return (uint32_t)((int32_t)a >> shamt);        /* sra */
-                } else {
-                    return a >> shamt;                             /* srl */
-                }
-            case 0x6: return a | b;                                 /* or */
-            case 0x7: return a & b;                                 /* and */
-            default: return 0;
-        }
+    if (i->opcode == 0x37) return (uint32_t)i->imm;
+    if (i->opcode == 0x17) return pc + (uint32_t)i->imm;
+    if (i->opcode == 0x03 || i->opcode == 0x23) return a + (uint32_t)i->imm;
+    int is_r = i->opcode == 0x33;
+    if (!is_r) b = (uint32_t)i->imm;
+    switch (i->funct3) {
+    case 0: return is_r && i->funct7 == 0x20 ? a - b : a + b;
+    case 1: return a << (b & 31);
+    case 2: return (int32_t)a < (int32_t)b;
+    case 3: return a < b;
+    case 4: return a ^ b;
+    case 5: return i->funct7 == 0x20 ? (uint32_t)((int32_t)a >> (b & 31)) : a >> (b & 31);
+    case 6: return a | b;
+    case 7: return a & b;
     }
     return 0;
 }
-
-static int branch_taken(uint32_t funct3, uint32_t a, uint32_t b) {
-    switch (funct3) {
-        case 0x0: return a == b;                          /* beq */
-        case 0x1: return a != b;                          /* bne */
-        case 0x4: return (int32_t)a < (int32_t)b;         /* blt */
-        case 0x5: return (int32_t)a >= (int32_t)b;        /* bge */
-        case 0x6: return a < b;                           /* bltu */
-        case 0x7: return a >= b;                          /* bgeu */
-        default: return 0;
+static int branch_taken(uint32_t f3, uint32_t a, uint32_t b) {
+    switch (f3) {
+    case 0: return a == b;
+    case 1: return a != b;
+    case 4: return (int32_t)a < (int32_t)b;
+    case 5: return (int32_t)a >= (int32_t)b;
+    case 6: return a < b;
+    case 7: return a >= b;
+    }
+    return 0;
+}
+static MemStatus load_value(Memory *m, uint32_t addr, uint32_t f3, uint32_t *out) {
+    uint8_t b = 0; uint16_t h = 0;
+    MemStatus s;
+    switch (f3) {
+    case 0: case 4:
+        s = memory_read_byte(m, addr, &b);
+        *out = f3 == 0 ? (uint32_t)(int32_t)(int8_t)b : b; return s;
+    case 1: case 5:
+        s = memory_read_half(m, addr, &h);
+        *out = f3 == 1 ? (uint32_t)(int32_t)(int16_t)h : h; return s;
+    default: return memory_read_word(m, addr, out);
     }
 }
-
+static MemStatus store_value(Memory *m, uint32_t addr, uint32_t f3, uint32_t value) {
+    switch (f3) {
+    case 0: return memory_write_byte(m, addr, (uint8_t)value);
+    case 1: return memory_write_half(m, addr, (uint16_t)value);
+    default: return memory_write_word(m, addr, value);
+    }
+}
+static void trace_cycle(const Pipeline *p, const Pipeline *nx, uint32_t fetch_pc,
+                        int stall, int flush) {
+    fprintf(stderr, "[cycle %" PRIu64 "] IF %08x | ID %c%08x | EX %c%08x | MEM %c%08x | WB %c%08x%s%s\n",
+            nx->cycles, fetch_pc,
+            p->if_id.valid ? '*' : '-', p->if_id.pc,
+            p->id_ex.valid ? '*' : '-', p->id_ex.pc,
+            p->ex_mem.valid ? '*' : '-', p->ex_mem.pc,
+            p->mem_wb.valid ? '*' : '-', p->mem_wb.pc,
+            stall ? " STALL" : "", flush ? " FLUSH" : "");
+}
 CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
+    if (cpu->status != CPU_RUNNING) return cpu->status;
     Pipeline nx = *p;
-    nx.cycles = p->cycles + 1;
+    nx.cycles++;
+    cpu->cycle_count = nx.cycles;
+    nx.if_id.valid = nx.id_ex.valid = nx.ex_mem.valid = nx.mem_wb.valid = 0;
+    int stall = 0, flush = 0;
+    uint32_t redirect_pc = 0, fetch_pc = cpu->pc;
 
-    int stall = 0;
-    int squash = 0;
-    uint32_t redirect_pc = 0;
-    uint32_t current_fetch_pc = cpu->pc;
-
-    /* -------------------------------------------------------------
-     * 1. WB Stage (reads p->mem_wb)
-     * ------------------------------------------------------------- */
+    /* WB precedes every younger side effect, including MEM stores. An exit
+       or precise fault must stop the cycle immediately. */
     if (p->mem_wb.valid) {
-        if (p->mem_wb.fault != PF_NONE) {
-            cpu->status = (p->mem_wb.fault == PF_ILLEGAL) ? CPU_ILLEGAL_INSTRUCTION : CPU_MEM_FAULT;
-            cpu->fault_addr = p->mem_wb.fault_addr;
-            if (p->mem_wb.fault == PF_ILLEGAL) {
-                snprintf(cpu->fault_msg, sizeof(cpu->fault_msg),
-                         "illegal instruction 0x%08x at pc=0x%08x",
-                         p->mem_wb.instr.raw, p->mem_wb.pc);
-            } else {
-                snprintf(cpu->fault_msg, sizeof(cpu->fault_msg),
-                         "memory fault at addr=0x%08x pc=0x%08x",
-                         p->mem_wb.fault_addr, p->mem_wb.pc);
+        const MEMWB *w = &p->mem_wb;
+        if (w->fault) {
+            cpu->status = w->fault == PF_ILLEGAL ? CPU_ILLEGAL_INSTRUCTION : CPU_MEM_FAULT;
+            cpu->fault_addr = w->fault_addr;
+            snprintf(cpu->fault_msg, sizeof(cpu->fault_msg),
+                     "%s at address 0x%08x (instruction pc=0x%08x)",
+                     w->fault == PF_ILLEGAL ? "illegal instruction" :
+                     w->fault == PF_FETCH ? "instruction fetch out of bounds" : "memory access out of bounds",
+                     w->fault_addr, w->pc);
+        } else {
+            if (w->ctrl.reg_write) cpu_write_reg(cpu, w->instr.rd, w->wb_val);
+            if (w->ctrl.is_system) {
+                CPUState call = *cpu;
+                call.pc = w->pc;
+                if (p->reference_timing) {
+                    /* Later starter models syscall arguments as ordinary
+                       latched/forwarded operands, even in unsafe none mode. */
+                    cpu_write_reg(&call, 17, w->wb_val);
+                    cpu_write_reg(&call, 10, w->syscall_arg);
+                }
+                DecodedInstr instr = w->instr;
+                w->handler->execute(&call, mem, &instr);
+                cpu->status = call.status;
+                cpu->fault_addr = call.fault_addr;
+                memcpy(cpu->fault_msg, call.fault_msg, sizeof(cpu->fault_msg));
             }
-            *p = nx;
-            cpu->cycle_count = p->cycles;
-            return cpu->status;
+            nx.retired++;
         }
-
-        if (p->mem_wb.ctrl.reg_write) {
-            cpu_write_reg(cpu, p->mem_wb.instr.rd, p->mem_wb.wb_val);
+        if (cpu->status != CPU_RUNNING) {
+            /* A younger ID stall can overlap the final drain cycles and
+               therefore need not delay this terminal instruction at all. */
+            nx.discarded_stalls =
+                (p->if_id.valid ? p->if_id.stalled_cycles : 0) +
+                (p->id_ex.valid ? p->id_ex.stalled_cycles : 0) +
+                (p->ex_mem.valid ? p->ex_mem.stalled_cycles : 0);
+            if (p->trace) trace_cycle(p, &nx, fetch_pc, 0, 0);
+            *p = nx; return cpu->status;
         }
-
-        if (p->mem_wb.ctrl.is_system) {
-            uint32_t saved_pc = cpu->pc;
-            cpu->pc = p->mem_wb.pc;
-            p->mem_wb.handler->execute(cpu, mem, &p->mem_wb.instr);
-            cpu->pc = saved_pc;
-            if (cpu->status != CPU_RUNNING) {
-                nx.retired++;
-                *p = nx;
-                cpu->cycle_count = p->cycles;
-                return cpu->status;
-            }
-        }
-
-        nx.retired++;
     }
-
-    /* -------------------------------------------------------------
-     * 2. MEM Stage (reads p->ex_mem, writes nx.mem_wb)
-     * ------------------------------------------------------------- */
-    nx.mem_wb.valid = 0;
     if (p->ex_mem.valid) {
-        nx.mem_wb.valid = 1;
-        nx.mem_wb.pc = p->ex_mem.pc;
-        nx.mem_wb.fault = p->ex_mem.fault;
-        nx.mem_wb.instr = p->ex_mem.instr;
-        nx.mem_wb.handler = p->ex_mem.handler;
-        nx.mem_wb.ctrl = p->ex_mem.ctrl;
-        nx.mem_wb.fault_addr = p->ex_mem.fault_addr;
-        nx.mem_wb.wb_val = p->ex_mem.alu_result;
-
-        if (p->ex_mem.fault == PF_NONE) {
-            if (p->ex_mem.ctrl.mem_read) {
-                uint32_t addr = p->ex_mem.alu_result;
-                MemStatus ms = MEM_OK;
-                switch (p->ex_mem.instr.funct3) {
-                    case 0x0: { /* lb: sign-extend */
-                        uint8_t b = 0;
-                        ms = memory_read_byte(mem, addr, &b);
-                        nx.mem_wb.wb_val = (uint32_t)(int32_t)(int8_t)b;
-                        break;
-                    }
-                    case 0x1: { /* lh: sign-extend */
-                        uint16_t h = 0;
-                        ms = memory_read_half(mem, addr, &h);
-                        nx.mem_wb.wb_val = (uint32_t)(int32_t)(int16_t)h;
-                        break;
-                    }
-                    case 0x2: { /* lw */
-                        uint32_t w = 0;
-                        ms = memory_read_word(mem, addr, &w);
-                        nx.mem_wb.wb_val = w;
-                        break;
-                    }
-                    case 0x4: { /* lbu: zero-extend */
-                        uint8_t b = 0;
-                        ms = memory_read_byte(mem, addr, &b);
-                        nx.mem_wb.wb_val = (uint32_t)b;
-                        break;
-                    }
-                    case 0x5: { /* lhu: zero-extend */
-                        uint16_t h = 0;
-                        ms = memory_read_half(mem, addr, &h);
-                        nx.mem_wb.wb_val = (uint32_t)h;
-                        break;
-                    }
-                    default:
-                        break;
-                }
-                if (ms != MEM_OK) {
-                    nx.mem_wb.fault = PF_MEM;
-                    nx.mem_wb.fault_addr = addr;
-                }
-            } else if (p->ex_mem.ctrl.mem_write) {
-                uint32_t addr = p->ex_mem.alu_result;
-                MemStatus ms = MEM_OK;
-                switch (p->ex_mem.instr.funct3) {
-                    case 0x0: /* sb */
-                        ms = memory_write_byte(mem, addr, (uint8_t)p->ex_mem.store_val);
-                        break;
-                    case 0x1: /* sh */
-                        ms = memory_write_half(mem, addr, (uint16_t)p->ex_mem.store_val);
-                        break;
-                    case 0x2: /* sw */
-                        ms = memory_write_word(mem, addr, p->ex_mem.store_val);
-                        break;
-                    default:
-                        break;
-                }
-                if (ms != MEM_OK) {
-                    nx.mem_wb.fault = PF_MEM;
-                    nx.mem_wb.fault_addr = addr;
-                }
-            }
+        const EXMEM *e = &p->ex_mem;
+        MEMWB w = {0};
+        w.valid = 1; w.pc = e->pc; w.stalled_cycles = e->stalled_cycles; w.fault = e->fault; w.fault_addr = e->fault_addr;
+        w.instr = e->instr; w.handler = e->handler; w.ctrl = e->ctrl;
+        w.wb_val = e->alu_result; w.syscall_arg = e->store_val;
+        if (!w.fault) {
+            MemStatus s = MEM_OK;
+            if (e->ctrl.mem_read) s = load_value(mem, e->alu_result, e->instr.funct3, &w.wb_val);
+            if (e->ctrl.mem_write) s = store_value(mem, e->alu_result, e->instr.funct3, e->store_val);
+            if (s != MEM_OK) { w.fault = PF_MEM; w.fault_addr = e->alu_result; }
         }
+        nx.mem_wb = w;
     }
-
-    /* -------------------------------------------------------------
-     * 3. EX Stage (reads p->id_ex, writes nx.ex_mem)
-     * ------------------------------------------------------------- */
-    nx.ex_mem.valid = 0;
     if (p->id_ex.valid) {
-        nx.ex_mem.valid = 1;
-        nx.ex_mem.pc = p->id_ex.pc;
-        nx.ex_mem.fault = p->id_ex.fault;
-        nx.ex_mem.instr = p->id_ex.instr;
-        nx.ex_mem.handler = p->id_ex.handler;
-        nx.ex_mem.ctrl = p->id_ex.ctrl;
-        nx.ex_mem.fault_addr = 0;
-        nx.ex_mem.alu_result = 0;
-        nx.ex_mem.store_val = p->id_ex.rs2_val;
-
-        if (p->id_ex.fault == PF_NONE) {
-            Operands o = forward_operands(p, &p->id_ex);
-            nx.fwd_ex += o.fwd_ex;
-            nx.fwd_mem += o.fwd_mem;
-            nx.ex_mem.store_val = o.b;
-
-            if (p->id_ex.ctrl.is_branch) {
-                int taken = branch_taken(p->id_ex.instr.funct3, o.a, o.b);
-                uint32_t target = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
-                uint32_t real_next = taken ? target : (p->id_ex.pc + 4);
-
-                if (p->predictor != NULL) {
+        const IDEX *d = &p->id_ex;
+        EXMEM e = {0};
+        e.valid = 1; e.pc = d->pc; e.stalled_cycles = d->stalled_cycles; e.fault = d->fault; e.fault_addr = d->pc;
+        e.instr = d->instr; e.handler = d->handler; e.ctrl = d->ctrl;
+        if (!d->fault) {
+            Operands o = forward_operands(p, d);
+            nx.fwd_ex += o.fwd_ex; nx.fwd_mem += o.fwd_mem;
+            e.store_val = o.b;
+            if (d->ctrl.is_branch) {
+                int taken = branch_taken(d->instr.funct3, o.a, o.b);
+                uint32_t target = d->pc + (uint32_t)d->instr.imm;
+                redirect_pc = taken ? target : d->pc + 4;
+                if (p->predictor) {
                     nx.branches++;
-                    p->predictor->update(&nx.bp_state, p->id_ex.pc, target, taken);
-                    if (real_next != p->id_ex.pred_next) {
-                        /* Mispredict */
-                        nx.mispredicts++;
-                        nx.redirects++;
-                        squash = 1;
-                        redirect_pc = real_next;
-                    }
+                    flush = redirect_pc != d->pred_next;
+                    nx.mispredicts += flush;
+                    p->predictor->update(&nx.bp, d->pc, target, taken);
                 } else {
-                    /* Lab 2 / Lab 3 baseline without branch prediction (naive branch resolution) */
-                    if (taken) {
-                        nx.flushes++;
-                        squash = 1;
-                        redirect_pc = target;
+                    flush = taken;
+                }
+            } else if (d->ctrl.is_jump) {
+                e.alu_result = d->pc + 4;
+                flush = 1;
+                redirect_pc = d->instr.opcode == 0x67 ?
+                    (o.a + (uint32_t)d->instr.imm) & ~1u : d->pc + (uint32_t)d->instr.imm;
+                if (p->predictor) {
+                    if (d->instr.opcode == 0x67) {
+                        nx.jalr++; /* No indirect predictor: always redirect. */
+                    } else {
+                        nx.jal++;
+                        flush = redirect_pc != d->pred_next;
                     }
                 }
-            } else if (p->id_ex.ctrl.is_jump) {
-                nx.ex_mem.alu_result = p->id_ex.pc + 4;
-                if (p->id_ex.instr.opcode == 0x67) { /* jalr */
-                    uint32_t real_next = (o.a + (uint32_t)p->id_ex.instr.imm) & ~1u;
-                    if (p->predictor != NULL) {
-                        nx.jalr_count++;
-                        nx.redirects++;
-                        squash = 1;
-                        redirect_pc = real_next;
-                    } else {
-                        nx.flushes++;
-                        squash = 1;
-                        redirect_pc = real_next;
-                    }
-                } else { /* jal */
-                    if (p->predictor != NULL) {
-                        nx.jal_count++;
-                        /* JAL target was statically resolved in IF -> 0 cycle penalty */
-                    } else {
-                        /* Lab 2 / Lab 3 without pre-decode redirects in EX */
-                        nx.flushes++;
-                        squash = 1;
-                        redirect_pc = p->id_ex.pc + (uint32_t)p->id_ex.instr.imm;
-                    }
-                }
+            } else if (d->ctrl.is_system) {
+                e.alu_result = o.a;
             } else {
-                nx.ex_mem.alu_result = alu(&p->id_ex.instr, p->id_ex.pc, o.a, o.b);
+                e.alu_result = alu(&d->instr, d->pc, o.a, o.b);
             }
         }
+        nx.ex_mem = e;
     }
-
-    /* -------------------------------------------------------------
-     * 4. ID Stage (reads p->if_id, writes nx.id_ex)
-     * ------------------------------------------------------------- */
-    nx.id_ex.valid = 0;
-    if (squash) {
-        /* Branch mispredict or jump redirect squashes ID */
-        nx.id_ex.valid = 0;
-    } else if (p->if_id.valid) {
-        DecodedInstr d;
-        const InstructionHandler *h = NULL;
-        DecodeStatus ds = decode_instruction(p->if_id.raw, &d, &h);
-        ControlSignals ctrl = control_decode(&d, h);
-
-        HazardVerdict hz = hazard_check(p, &d, &ctrl);
-        if (hz.stall) {
-            nx.id_ex.valid = 0;        /* 1. a bubble enters EX this cycle */
-            nx.if_id = p->if_id;        /* 2. IF/ID is frozen: re-decoded next cycle */
-            stall = 1;                 /* 3. local flag: IF must not fetch */
-            nx.stalls++;
-            if (hz.load_use) {
-                nx.load_use_stalls++;
-            }
-        } else {
-            nx.id_ex.valid = 1;
-            nx.id_ex.pc = p->if_id.pc;
-            nx.id_ex.fault = p->if_id.fault;
-            if (nx.id_ex.fault == PF_NONE && ds == DECODE_UNKNOWN_INSTRUCTION) {
-                nx.id_ex.fault = PF_ILLEGAL;
-            }
-            nx.id_ex.instr = d;
-            nx.id_ex.handler = h;
-            nx.id_ex.ctrl = ctrl;
-            nx.id_ex.pred_next = p->if_id.pred_next;
-            nx.id_ex.rs1_val = cpu_read_reg(cpu, d.rs1);
-            nx.id_ex.rs2_val = cpu_read_reg(cpu, d.rs2);
-        }
-    }
-
-    /* -------------------------------------------------------------
-     * 5. IF Stage (writes nx.if_id)
-     * ------------------------------------------------------------- */
-    if (squash) {
-        /* 2-cycle penalty: squashes instruction fetched in IF and redirects fetch PC */
-        nx.if_id.valid = 0;
+    /* A redirect beats a younger hazard or decode fault. */
+    if (flush) {
+        nx.flushes++;
         cpu->pc = redirect_pc;
-        nx.squashed += 2;
-    } else if (stall) {
-        /* IF is frozen: nx.if_id is already p->if_id from ID, cpu->pc unchanged */
-    } else {
-        uint32_t fetch_pc = cpu->pc;
-        uint32_t raw = 0;
-        nx.if_id.valid = 1;
-        nx.if_id.pc = fetch_pc;
-        if (memory_read_word(mem, fetch_pc, &raw) != MEM_OK) {
-            nx.if_id.fault = PF_FETCH;
-            nx.if_id.raw = 0;
-            nx.if_id.pred_next = fetch_pc + 4;
-            cpu->pc = fetch_pc + 4;
-        } else {
-            nx.if_id.fault = PF_NONE;
-            nx.if_id.raw = raw;
-
-            uint32_t pred_next = fetch_pc + 4;
-            if (p->predictor != NULL) {
-                uint32_t opcode = raw & 0x7F;
-                if (opcode == 0x63) { /* conditional branch */
-                    int32_t b12   = (int32_t)((raw >> 31) & 0x1);
-                    int32_t b11   = (int32_t)((raw >> 7)  & 0x1);
-                    int32_t b10_5 = (int32_t)((raw >> 25) & 0x3F);
-                    int32_t b4_1  = (int32_t)((raw >> 8)  & 0xF);
-                    int32_t v = (b12 << 12) | (b11 << 11) | (b10_5 << 5) | (b4_1 << 1);
-                    if (v & 0x1000) v |= 0xFFFFE000;
-                    uint32_t target = fetch_pc + (uint32_t)v;
-
-                    if (p->predictor->predict(&p->bp_state, fetch_pc, target)) {
-                        pred_next = target;
-                    } else {
-                        pred_next = fetch_pc + 4;
-                    }
-                } else if (opcode == 0x6F) { /* JAL */
-                    int32_t b20    = (int32_t)((raw >> 31) & 0x1);
-                    int32_t b19_12 = (int32_t)((raw >> 12) & 0xFF);
-                    int32_t b11    = (int32_t)((raw >> 20) & 0x1);
-                    int32_t b10_1  = (int32_t)((raw >> 21) & 0x3FF);
-                    int32_t v = (b20 << 20) | (b19_12 << 12) | (b11 << 11) | (b10_1 << 1);
-                    if (v & 0x100000) v |= 0xFFE00000;
-                    pred_next = fetch_pc + (uint32_t)v;
-                } else {
-                    pred_next = fetch_pc + 4;
-                }
-            } else {
-                pred_next = fetch_pc + 4;
+    } else if (p->if_id.valid) {
+        IDEX d = {0};
+        d.valid = 1; d.pc = p->if_id.pc; d.stalled_cycles = p->if_id.stalled_cycles; d.fault = p->if_id.fault;
+        d.pred_next = p->if_id.pred_next;
+        if (!d.fault && decode_instruction(p->if_id.raw, &d.instr, &d.handler) != DECODE_OK)
+            d.fault = PF_ILLEGAL;
+        if (!d.fault) {
+            d.ctrl = control_decode(&d.instr, d.handler);
+            if (d.ctrl.is_system && p->reference_timing) {
+                d.ctrl.uses_rs1 = d.ctrl.uses_rs2 = 1;
+                d.instr.rs1 = 17; d.instr.rs2 = 10;
             }
-
-            nx.if_id.pred_next = pred_next;
-            cpu->pc = pred_next;
+            HazardVerdict hz = hazard_check(p, &d.instr, &d.ctrl);
+            if (hz.stall) {
+                stall = 1; nx.stalls++; nx.load_use_stalls += hz.load_use;
+                nx.if_id = p->if_id; nx.if_id.stalled_cycles++;
+            } else {
+                d.rs1_val = cpu_read_reg(cpu, d.instr.rs1);
+                d.rs2_val = cpu_read_reg(cpu, d.instr.rs2);
+            }
         }
+        if (!stall) nx.id_ex = d;
     }
-
-    /* Trace logging */
-    if (p->trace_mode) {
-        char if_s[16], id_s[16], ex_s[16], mem_s[16], wb_s[16];
-        snprintf(if_s, sizeof(if_s), "0x%08x", current_fetch_pc);
-        if (p->if_id.valid) snprintf(id_s, sizeof(id_s), "0x%08x", p->if_id.pc);
-        else snprintf(id_s, sizeof(id_s), "----------");
-        if (p->id_ex.valid) snprintf(ex_s, sizeof(ex_s), "0x%08x", p->id_ex.pc);
-        else snprintf(ex_s, sizeof(ex_s), "----------");
-        if (p->ex_mem.valid) snprintf(mem_s, sizeof(mem_s), "0x%08x", p->ex_mem.pc);
-        else snprintf(mem_s, sizeof(mem_s), "----------");
-        if (p->mem_wb.valid) snprintf(wb_s, sizeof(wb_s), "0x%08x", p->mem_wb.pc);
-        else snprintf(wb_s, sizeof(wb_s), "----------");
-
-        fprintf(stdout, "[cycle %llu] IF %s | ID %s | EX %s | MEM %s | WB %s\n",
-                (unsigned long long)p->cycles + 1, if_s, id_s, ex_s, mem_s, wb_s);
+    if (!stall && !(flush && p->reference_timing)) {
+        IFID f = {0}; f.valid = 1; f.pc = cpu->pc;
+        fetch_pc = f.pc;
+        if (memory_read_word(mem, f.pc, &f.raw) != MEM_OK) f.fault = PF_FETCH;
+        f.pred_next = f.pc + 4;
+        if (p->predictor && !f.fault) {
+            DecodedInstr instr;
+            const InstructionHandler *handler;
+            /* Reuse the decoder for target immediates; IF never reads registers. */
+            if (decode_instruction(f.raw, &instr, &handler) == DECODE_OK) {
+                uint32_t target = f.pc + (uint32_t)instr.imm;
+                if (handler->format == FMT_B &&
+                    p->predictor->predict(&nx.bp, f.pc, target)) f.pred_next = target;
+                else if (handler->format == FMT_J) f.pred_next = target;
+            }
+        }
+        nx.if_id = f;
+        cpu->pc = f.pred_next;
     }
-
-    /* Commit */
+    if (p->trace) trace_cycle(p, &nx, fetch_pc, stall, flush);
     *p = nx;
-    cpu->cycle_count = p->cycles;
     return cpu->status;
 }
-
 void pipeline_run_batch(Pipeline *p, CPUState *cpu, Memory *mem, uint64_t max_cycles) {
-    while (cpu->status == CPU_RUNNING && p->cycles < max_cycles) {
-        pipeline_cycle(p, cpu, mem);
+    while (cpu->status == CPU_RUNNING && p->cycles < max_cycles) pipeline_cycle(p, cpu, mem);
+    putchar('\n');
+    print_registers(cpu); print_status(cpu);
+    printf("pipeline: mode=%s timing=%s cycles=%" PRIu64 " retired=%" PRIu64
+           " stalls=%" PRIu64 " flushes=%" PRIu64 " CPI=%.3f fwd_ex=%" PRIu64
+           " fwd_mem=%" PRIu64 " load_use=%" PRIu64 " discarded_stalls=%" PRIu64 "\n",
+           p->no_hazards ? "none" : p->forwarding ? "forward" : "stall",
+           p->reference_timing ? "reference" : "sheet", p->cycles, p->retired, p->stalls, p->flushes,
+           p->retired ? (double)p->cycles / p->retired : 0.0,
+           p->fwd_ex, p->fwd_mem, p->load_use_stalls, p->discarded_stalls);
+    if (p->predictor) {
+        printf("predictor: name=%s branches=%" PRIu64 " mispredicts=%" PRIu64
+               " accuracy=%.1f jal=%" PRIu64 " jalr=%" PRIu64 " redirects=%" PRIu64
+               " squashed=%" PRIu64 "\n", p->predictor->name, p->branches, p->mispredicts,
+               p->branches ? 100.0 * (p->branches - p->mispredicts) / p->branches : 0.0,
+               p->jal, p->jalr, p->flushes, 2 * p->flushes);
     }
-    printf("\n");
-    print_registers(cpu);
-    print_status(cpu);
-    if (cpu->status == CPU_RUNNING) {
-        printf("  -> stopped: reached max cycle limit (%llu)\n", (unsigned long long)max_cycles);
-    }
-
-    if (p->predictor != NULL) {
-        /* Lab 4 Branch Predictor Summary Banner */
-        printf("pipeline            = 5-stage, hazard unit '%s', predictor '%s'\n",
-               p->forwarding ? "forward" : "stall",
-               p->predictor->name);
-        printf("retired             = %llu\n", (unsigned long long)p->retired);
-        printf("CPI                 = %.3f\n", p->retired > 0 ? (double)p->cycles / (double)p->retired : 0.0);
-        printf("stalls              = %llu\n", (unsigned long long)p->stalls);
-        printf("forwards            = %llu\n", (unsigned long long)(p->fwd_ex + p->fwd_mem));
-        printf("branches            = %llu        conditional branches executed\n", (unsigned long long)p->branches);
-        printf("mispredicts         = %llu         ... of which the guess was wrong\n", (unsigned long long)p->mispredicts);
-        double acc = (p->branches > 0) ? (100.0 * (double)(p->branches - p->mispredicts) / (double)p->branches) : 0.0;
-        printf("accuracy            = %.1f%%\n", acc);
-        printf("jal                 = %llu         redirected in IF: free\n", (unsigned long long)p->jal_count);
-        printf("jalr                = %llu         never predicted: 2 cycles each\n", (unsigned long long)p->jalr_count);
-        printf("redirects           = %llu         mispredicts + jalr\n", (unsigned long long)p->redirects);
-        printf("squashed            = %llu         instructions thrown away (2 per redirect)\n", (unsigned long long)p->squashed);
-    } else {
-        /* Lab 2 / Lab 3 Summary Line */
-        printf("pipeline: mode=%s cycles=%llu retired=%llu stalls=%llu flushes=%llu "
-               "CPI=%.3f fwd_ex=%llu fwd_mem=%llu load_use=%llu\n",
-               p->forwarding ? "forward" : "stall",
-               (unsigned long long)p->cycles,
-               (unsigned long long)p->retired,
-               (unsigned long long)p->stalls,
-               (unsigned long long)p->flushes,
-               p->retired > 0 ? (double)p->cycles / (double)p->retired : 0.0,
-               (unsigned long long)p->fwd_ex,
-               (unsigned long long)p->fwd_mem,
-               (unsigned long long)p->load_use_stalls);
-    }
+    if (cpu->status == CPU_RUNNING)
+        printf("  -> stopped: reached max cycle limit (%" PRIu64 ")\n", max_cycles);
 }

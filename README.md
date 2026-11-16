@@ -1,169 +1,216 @@
-# RV32I Processor Simulator: Single-Cycle & 5-Stage Pipeline
+# RV32I Architecture Labs: Weeks 6–9
 
-A modular, teaching-oriented **cycle-accurate RV32I RISC-V processor simulator** written in C11. This project spans four progressive computer architecture lab assignments:
+A modular RV32I processor simulator written in C11. The project progresses from
+single-cycle execution to a synchronous five-stage pipeline, data forwarding,
+and branch prediction. Labs 1–4 are implemented; Lab 5 (RV32F) is specified but
+**pending implementation**. Source code lives in [`riscv_sim_base/`](riscv_sim_base/).
 
-- **Lab 1 (Week 6): Baseline Single-Cycle RV32I Simulator** — Models architectural state (`CPUState`), byte-addressable memory (`Memory`), instruction decoding, two-pass assembly, and dynamic dispatch via a central ISA registry (`core/isa_registry.c`).
-- **Lab 2 (Week 7): 5-Stage Pipelined Simulator (Stalling & Flushing)** — Slices instruction execution across 5 synchronous stages (**IF, ID, EX, MEM, WB**) using clock latches (`IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB`), a snapshot/commit execution model, control signal generation, naive 3-latch stalling for RAW hazards, and branch flushes.
-- **Lab 3 (Week 8): Data Hazards, Forwarding & Load-Use Interlocks** — Introduces an autonomous Hazard Detection Unit and a Forwarding Unit. Forwards ALU results directly from `EX/MEM` and `MEM/WB` into EX inputs, eliminating almost all stalls while enforcing an unavoidable 1-cycle stall for true load-use hazards.
-- **Lab 4 (Week 9): Branch Prediction & Pre-Decode Unit** — Integrates branch direction prediction (`not-taken`, `btfn`, `1bit`, `2bit`), pre-decodes `jal` in the IF stage (making unconditional direct jumps completely free with 0 penalty cycles), evaluates conditional branches in EX with a 2-cycle penalty on mispredict, penalizes `jalr` by 2 cycles (no RAS), and implements cycle-by-cycle `--trace` logging.
+The pipeline is cycle-accurate for its documented educational timing models.
+It does not simulate gates, clock frequency, caches, or a complete privileged
+RISC-V platform. The supported base instructions are those listed below; CSR,
+RV32M and floating-point instructions are not currently implemented.
 
----
+## Choose a document
 
-## 1. Directory Structure
+| Document | Purpose |
+|---|---|
+| [tutorial.md](tutorial.md) | Build, run individual sample tests, run the full suite, compare results and debug traces |
+| [COMPREHENSIVE_LAB_GUIDE.md](COMPREHENSIVE_LAB_GUIDE.md) | Implementation details, latch timing, hazards, prediction, and the planned FP architecture |
+| [LAB_SHEETS_EXPLAINED.md](LAB_SHEETS_EXPLAINED.md) | Start from zero: processor concepts and what each week's lab asks you to build |
+| [W6–W8 implementation record](riscv_sim_base/W6_W8_IMPLEMENTATION.md) | Earlier measured results and implementation decisions |
+| [W9 implementation record](riscv_sim_base/W9_IMPLEMENTATION.md) | Predictor design and measured W9 results |
 
-```text
-Lab Assignment/
-├── README.md                      # Master architecture and execution guide
-├── verify_all.py                  # Automated test and oracle verification suite (Labs 1-4)
-├── W6_RV32I_Processor_Simulator.md# Lab 1 notes (transcribed slides)
-├── W7_RISCV_Pipeline_Lab_Sheet.md # Lab 2 handout and specifications
-├── W8_Lab_Sheet_3_Data_Hazards.md # Lab 3 handout and specifications
-├── W9_Lab Sheet 4 Branch Prediction on the Pipelined RV32I Simulator.md # Lab 4 handout and specs
-└── riscv_sim_base/
-    ├── Makefile                   # Build configuration with dynamic predictor targets
-    ├── main.c                     # Program entry point and CLI option routing
-    ├── core/                      # Core architectural models (untouched)
-    │   ├── cpu_state.h/.c         # Registers x0..x31 (x0 hardwired to 0), PC, status
-    │   ├── memory.h/.c            # 1 MB flat byte-addressable little-endian RAM
-    │   ├── isa_registry.h/.c      # Instruction dispatch table (single source of truth)
-    │   ├── decoder.h/.c           # Bit-field extraction & sign-extended immediates
-    │   └── executor.h/.c          # Single-cycle execution loop (Reference Oracle)
-    ├── isa/
-    │   └── rv32i_base.h/.c        # RV32I instruction handlers (add, sub, lw, sw, beq...)
-    ├── assembler/
-    │   └── assembler.h/.c         # Two-pass assembler (resolves labels & produces machine code)
-    ├── pipeline/                  # Modular pipeline & branch prediction implementation
-    │   ├── control.h/.c           # ControlSignals struct and control_decode()
-    │   ├── pipeline_state.h       # IFID, IDEX, EXMEM, MEMWB latches & Pipeline struct
-    │   ├── hazard.h/.c            # HazardVerdict, produces(), hazard_check(), forward_operands()
-    │   ├── branch_predictor.h/.c  # BranchPredictor struct, BPState (64 entries), predictor registry
-    │   ├── bp_static.c            # Static predictors: 'not-taken' and 'btfn'
-    │   ├── bp_dynamic.c           # Dynamic predictors: '1bit' and '2bit' saturating counters
-    │   └── pipeline.c             # 5-stage pipeline_cycle() & pipeline_run_batch()
-    ├── ui/
-    │   └── cli_display.h/.c       # CLI debugger REPL and register dump routines
-    └── tests/                     # Test assembly programs
-        ├── micro.s                # 5-instruction RAW dependency benchmark (Lab 3 §4)
-        ├── sample1_sum_loop.s     # Sum 1 to 10 loop benchmark (53 instructions)
-        ├── sample2_mem_and_branches.s # Load/store and branch comparison benchmark
-        ├── load_use_test.s        # Comprehensive 4-case load-use hazard verification
-        ├── t1_counted_loop.s      # Lab 4 single loop (9 taken, 1 not-taken backward branch)
-        ├── t2_nested_loops.s      # Lab 4 nested loops (hysteresis benchmark)
-        ├── t3_alternating.s       # Lab 4 alternating T/N forward branches
-        └── t4_calls.s             # Lab 4 nested calls, returns, JALs, and load-use stalls
-```
+## Implemented progression
 
----
+| Lab | Week | Result |
+|---|---|---|
+| 1 | W6 | 32 integer registers, x0 hardwired to zero, default 1 MiB byte-addressable RAM, two-pass assembler, registry dispatch, single-cycle oracle |
+| 2 | W7 | IF/ID/EX/MEM/WB pipeline, four valid-bit latches, ID controls, EX redirects, WB-visible faults |
+| 3 | W8 | Selectable stalling/forwarding, operand bypassing, one-cycle load-use interlock, counters |
+| 4 | W9 | Four direction predictors, IF direct-jump handling, EX prediction checking, accuracy counters |
+| 5 | W10 | Pending: FP registers, FP assembler/decoder metadata, CSR/rounding helpers, 26 RV32F handlers |
 
-## 2. Prerequisites & Building
+All supported terminating examples use `ecall`: a7=1 prints signed a0; a7=10 exits.
+The single-cycle model counts one clock per executed instruction, including exit,
+so normal successful runs have $\mathrm{CPI}=1$. This is a functional reference,
+not evidence of equal hardware clock periods across engines.
 
-### Prerequisites
-- GCC with C11 support (`gcc` / MinGW-w64 on Windows)
-- GNU `make`
-- Python 3.7+ (for running `verify_all.py`)
+## Build and run
 
-### Compilation
-From the project root:
+### Linux, WSL, or another GCC/Make environment
+
+From this repository root:
+
 ```bash
 cd riscv_sim_base
-make clean
 make
-```
-This builds all core components, ISA handlers, assembler, pipeline logic, and branch predictors into `rvsim` (`rvsim.exe` on Windows).
-
----
-
-## 3. How to Run
-
-### A. Lab 1 — Single-Cycle Mode (`--batch` or interactive REPL)
-Runs 1 instruction per cycle ($\text{CPI} = 1.0$). This engine serves as the **Reference Oracle** across all labs.
-```bash
-# Batch mode (runs to completion and prints register dump)
-./rvsim tests/sample1_sum_loop.s --batch
-
-# Interactive debugger (supports 'step', 'run', 'regs', 'mem', 'break')
-./rvsim tests/sample1_sum_loop.s
+make test
+./rvsim tests/sample1_sum_loop.s --pipeline-forward
+./rvsim tests/given/lab4_branch/b1_patterns.s --predictor 2bit
 ```
 
-### B. Lab 2 — 5-Stage Pipelined Mode with Naive Stalling (`--pipeline`)
-Executes the five stages concurrently. Detects RAW hazards across a 3-latch window (`ID/EX`, `EX/MEM`, `MEM/WB`) and stalls by freezing IF and ID while injecting a bubble into EX. Branches are evaluated in EX and flush younger instructions on taken conditions.
-```bash
-./rvsim tests/sample1_sum_loop.s --pipeline
+Requires GCC (or a compatible C11 compiler), Make, and Python 3 for tests.
+`make test` builds both C verifiers before starting the Python harness. Running
+`python3 tests/run_tests.py` directly requires those binaries to exist first.
+
+### Native Windows: MSVC
+
+Use **Developer PowerShell for Visual Studio 2022** with the C++ build tools
+installed. Run from the repository root:
+
+```powershell
+Set-Location riscv_sim_base
+$sources = Get-ChildItem core,isa,assembler,ui,pipeline -Filter *.c |
+    ForEach-Object { $_.FullName }
+cl /nologo /std:c11 /W4 /D_CRT_SECURE_NO_WARNINGS /Icore /Iisa /Iassembler /Iui /Ipipeline $sources main.c /Fe:rvsim.exe
+.\rvsim.exe tests\sample1_sum_loop.s --pipeline-forward
 ```
 
-### C. Lab 3 — 5-Stage Pipelined Mode with Data Forwarding (`--pipeline-forward`)
-Activates operand bypassing from `EX/MEM` (distance 1) and `MEM/WB` (distance 2) directly into EX ALU inputs, store data, branch comparisons, and `jalr` target calculations. Detects load-use dependencies and injects an unavoidable 1-cycle stall.
-```bash
-./rvsim tests/load_use_test.s --pipeline-forward
+MSVC commands are provided for the C11 source layout; they have not been executed
+on Windows in this environment. The bundled Makefile uses GCC options and is not
+an NMake makefile. For the exact tested build/test workflow on Windows, use WSL
+and the Linux commands above. Native verifier build commands are in the tutorial.
+
+## CLI reference
+
+```text
+rvsim <program.s> [options]
 ```
 
-### D. Lab 4 — Branch Prediction & Trace Modes
-Specifies a branch prediction policy (`not-taken`, `btfn`, `1bit`, `2bit`). JAL instructions are pre-decoded in IF (free), conditional branches mispredict with a 2-cycle penalty, and `jalr` returns cost 2 cycles:
-```bash
-# Run with static 'not-taken' predictor
-./rvsim tests/t1_counted_loop.s --batch --predictor not-taken
+| Option | Behavior |
+|---|---|
+| No engine option | Original single-cycle interactive debugger |
+| `--batch` | Original single-cycle batch execution, unless another mode is selected |
+| `--single-cycle` | Explicit original batch engine |
+| `--pipeline` | W7/W8 sheet timing, conservative three-latch stalling |
+| `--pipeline-forward` | Sheet timing, forwarding and load-use detection |
+| `--pipeline-basic` | Reference timing, no hazards; intentionally unsafe teaching mode |
+| `--hazard stall` | Reference timing, two-latch interlock with same-cycle WB-to-ID reads |
+| `--hazard forward` | Reference timing, forwarding and load-use detection |
+| `--hazard none` | Reference timing, no hazards; reproduces intentionally wrong goldens |
+| `--predictor NAME` | W9: `not-taken`, `btfn`, `1bit`, `2bit`; implies reference timing and forwarding unless `--hazard` is supplied |
+| `--trace` | Pipeline clock trace to stderr; has no effect in the original engine |
+| `--max-cycles N` | Batch clock limit; default 1,000,000 |
+| `--mem-size N` | Simulated RAM bytes; default 1,048,576 |
 
-# Run with static 'btfn' (backward taken, forward not-taken)
-./rvsim tests/t1_counted_loop.s --batch --predictor btfn
+Pipeline selectors imply batch execution. `--predictor` accepts `--hazard` before
+or after it, but rejects combination with an explicit legacy engine selector
+(`--single-cycle`, `--pipeline`, `--pipeline-forward`, `--pipeline-basic`). There
+is no implicit W9 mode: select `--predictor 2bit` explicitly. Avoid mixing other
+engine selectors; most legacy selections are processed in argument order.
+Pipeline stepping is not provided by the interactive debugger.
 
-# Run with dynamic '1bit' predictor
-./rvsim tests/t1_counted_loop.s --batch --predictor 1bit
+## Source tree
 
-# Run with dynamic '2bit' saturating counter predictor
-./rvsim tests/t1_counted_loop.s --batch --predictor 2bit
+Generated binaries (`rvsim`, `pipeline_checks`, `predictor_checks`) and `.o`/`.d`
+files are omitted here. `*.h`/`*.c` denotes the actual paired header/source files.
 
-# Run with cycle-by-cycle 5-stage ASCII pipeline trace
-./rvsim tests/t1_counted_loop.s --batch --predictor 2bit --trace
+```text
+riscv_sim_base/
+├── main.c                       CLI, ISA setup, assembly and engine selection
+├── Makefile                     GCC build, header dependencies and test orchestration
+├── README.md                    Entry link back to the current root documentation
+├── W6_W8_IMPLEMENTATION.md       Historical W6–W8 implementation/measurement record
+├── W9_IMPLEMENTATION.md          W9 design, measurements and verification record
+├── core/
+│   ├── cpu_state.h / .c         Integer state, ABI names, x0 accessors, status
+│   ├── memory.h / .c            Bounds-checked little-endian byte/half/word RAM
+│   ├── isa_registry.h / .c      Instruction formats, handler registry and lookup
+│   ├── decoder.h / .c           Decode fields and reconstruct signed immediates
+│   └── executor.h / .c          Original single-cycle reference executor
+├── isa/
+│   └── rv32i_base.h / .c        Supported base instruction handlers and registration
+├── assembler/
+│   └── assembler.h / .c         Two passes, labels, encoding, directives and pseudo-ops
+├── ui/
+│   └── cli_display.h / .c       State display and original interactive debugger
+├── pipeline/
+│   ├── control.h / .c           Format-derived control and source-use signals
+│   ├── pipeline_state.h         IFID, IDEX, EXMEM, MEMWB and Pipeline structures
+│   ├── pipeline.c               Five-stage clock, redirects, faults, trace and summary
+│   ├── hazard.h / .c            RAW interlock and operand forwarding
+│   ├── branch_predictor.h / .c  Predictor interface, table index and name lookup
+│   ├── bp_static.c              Always-not-taken and BTFN implementations
+│   └── bp_dynamic.c             One-bit and two-bit implementations
+├── tests/
+│   ├── sample1_sum_loop.s       Original sum example: prints 55
+│   ├── sample2_mem_and_branches.s
+│   ├── micro.s                  Five-instruction dependency trace
+│   ├── run_tests.py             747 Python checks, goldens, CLI and timing checks
+│   ├── check_state.c            Full-memory/register oracle comparison verifier
+│   ├── check_predictor.c        State transitions, reset, aliasing and isolation assertions
+│   ├── regression/              Eight focused assembly corner cases
+│   └── given/
+│       ├── Cycles references.md Supplied cross-lab reference figures
+│       ├── lab1_skeleton/       s1–s3 baseline samples
+│       ├── lab2_pipeline/       p1–p3 plus expected/ goldens
+│       ├── lab3_hazards/        h1–h3 plus expected/ goldens
+│       ├── lab4_branch/         b1–b3 plus expected/ goldens
+│       └── lab5_fp/             f1–f3 plus expected/; reference-only, not executable yet
+└── results/
+    ├── verification.txt         Recorded standard/sanitizer verification
+    └── w9/                      Captured single-cycle and predictor/hazard runs
 ```
 
-### Additional Command-Line Options
-- `--hazard <stall|forward>`: Selects hazard unit policy (default: `forward` when `--predictor` is specified, otherwise `stall` under `--pipeline`).
-- `--single-cycle`: Explicitly runs the single-cycle execution engine.
-- `--max-cycles <N>`: Sets the maximum cycle limit (default: 1,000,000).
-- `--mem-size <N>`: Configures simulated memory size in bytes (default: 1,048,576 = 1 MB).
+The eight regressions are `exit_store`, `load_zero`, `precise_fetch`,
+`precise_illegal`, `precise_memory`, `predicted_loop_exit`, `redirect_priority`,
+and `wrong_path_branch` (all `.s`). The 15 supplied samples are present, but only
+12 are executable by this implementation; the three FP samples are pending.
 
----
+## Measured performance
 
-## 4. Benchmark Results & Verification Standards
+### W7/W8 sheet timing
 
-### A. Labs 1, 2, and 3 Pipeline Verification
+| Program | Single-cycle | Stalling cycles / CPI | Forwarding cycles / CPI | Cycle reduction from stalling |
+|---|---:|---|---|---:|
+| sample1_sum_loop | 53 | 108 / 2.038 | 68 / 1.283 | 37.0% |
+| sample2_mem_and_branches | 13 | 26 / 2.000 | 18 / 1.385 | 30.8% |
+| micro | 5 | 15 / 3.000 | 9 / 1.800 | 40.0% |
 
-| Program | Oracle Cycles | Lab 2 Cycles (Stalling) | Lab 3 Cycles (Forwarding) | Forwarding Speedup | Oracle Reg Match |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| `micro.s` | 5 | 15 (6 stalls, 0 flushes) | 9 (0 stalls, 0 flushes) | **1.67x** | **100% MATCH** |
-| `sample1_sum_loop.s` | 53 | 119 (40 stalls, 11 flushes) | 79 (0 stalls, 11 flushes) | **1.51x** | **100% MATCH** |
-| `sample2_mem_and_branches.s` | 13 | 27 (8 stalls, 1 flush) | 19 (0 stalls, 1 flush) | **1.42x** | **100% MATCH** |
-| `load_use_test.s` | 13 | 37 (18 stalls, 1 flush) | 23 (4 load-use stalls, 1 flush) | **1.61x** | **100% MATCH** |
+### Supplied W8 reference timing
 
-#### Pipeline Clock Accounting Identity:
-$$\text{cycles} = \text{retired} + 4 + \text{stalls} + 2 \times \text{flushes}$$
+| Program | Single-cycle | Stalling | Forwarding | Forward load-use stalls |
+|---|---:|---:|---:|---:|
+| h1_broad | 43 | 84 | 52 | 1 |
+| h2_edge | 30 | 53 | 40 | 4 |
+| h3_kernel | 321 | 749 | 461 | 36 |
 
----
+### Supplied W9 forwarding cycles
 
-### B. Lab 4 Branch Prediction Reference Benchmark (W9 §11 Golden Matrix)
+| Program | Single-cycle | W8 reference stalling, no prediction | W8 reference forwarding, no prediction | not-taken | btfn | 1bit | 2bit |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| b1_patterns | 1330 | 2528 | 1864 | 1856 | 1432 | 1506 | 1476 |
+| b2_adversarial | 4739 | 13461 | 5367 | 5287 | 5007 | 5033 | 4985 |
+| b3_applied | 3195 | 6268 | 4658 | 3986 | 3986 | 3970 | 3982 |
 
-| Program | Retired | Single-Cycle | not-taken | btfn | 1bit | 2bit |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `t1_counted_loop.s` | 37 | 37 | 59 (9 misses) | 43 (1 miss) | 45 (2 misses) | 45 (2 misses) |
-| `t2_nested_loops.s` | 52 | 52 | 78 (11 misses) | 66 (5 misses) | 76 (10 misses) | 70 (7 misses) |
-| `t3_alternating.s` | 50 | 50 | 76 (11 misses) | 64 (5 misses) | 74 (10 misses) | 74 (10 misses) |
-| `t4_calls.s` | 219 | 219 | 278 (2 misses) | 278 (2 misses) | 280 (3 misses) | 278 (2 misses) |
-| **Total Cycles** | **358** | **358** | **491** | **451** | **475** | **467** |
-| **Overall CPI** | **1.000** | **1.000** | **1.372** | **1.260** | **1.327** | **1.305** |
-| **Total Misses (62 branches)**| - | - | **33 (46.8% acc)** | **13 (79.0% acc)**| **25 (59.7% acc)**| **21 (66.1% acc)**|
+Even W9 `not-taken` improves on W8 forwarding: IF resolves direct `jal`, removing
+two redirect cycles per direct jump. Speedups here describe modeled cycles,
+not measured wall-clock execution time or hardware clock frequency.
 
-#### Lab 4 Branch Prediction Clock Accounting Identity:
-$$\text{cycles} = \text{retired} + 4 + 2 \times \text{redirects} + \text{stalls}$$
-$$\text{redirects} = \text{mispredicts} + \text{jalr}$$
+## Verification and scope
 
----
+`make test` reports **747 passing Python checks**, plus dedicated C predictor
+assertions. The suite checks supplied W7–W9 goldens, baseline programs, both
+safe hazard policies, both legacy timing models, all predictors, precise faults,
+wrong-path suppression, traces and limits. Every tested safe-mode register and
+memory comparison agrees with the single-cycle oracle. This is 100% agreement
+on the tested cases, not a formal proof for every possible program.
 
-## 5. Automated Verification Suite
+The full suite also passed `-O1 -Werror` with AddressSanitizer and
+UndefinedBehaviorSanitizer. Linux builds/runs were verified; Windows MSVC remains
+unverified. RARS was not run here: its supplied reference columns are labeled as
+such in the tutorial. The deliberately unsafe `none` modes are expected to
+produce wrong values or fault on dependency-heavy programs.
 
-Run the master test runner from the root directory:
-```bash
-python verify_all.py
-```
-This tests:
-1. **Lab 1-3 Suites**: Verifies register file equivalence across single-cycle, stalling, and forwarding modes, and validates the clock cycle accounting identities.
-2. **Lab 4 Suite**: Verifies that every single predictor (`not-taken`, `btfn`, `1bit`, `2bit`) matches the golden metrics (cycles, retired count, branches, mispredicts, JAL, JALR) and preserves register file fidelity against the single-cycle oracle.
+## Supported assembly and next step
+
+The base subset includes integer arithmetic/logic and shifts; `lui`, `auipc`;
+`lb/lh/lw/lbu/lhu`; `sb/sh/sw`; six conditional branches; `jal/jalr`; and `ecall`.
+Pseudo-ops: `nop`, `ret`, `j`, `mv`, `li`, `la`. Both `li` and `la` always expand
+to two instructions. Directives: `.text`, `.data`, `.globl`, `.word`, `.half`,
+`.byte`, `.align`. Sections share one flat address space; `.align n` aligns to
+an n-byte boundary, not a power-of-two exponent.
+
+FP fixtures do not imply FP support. Before W10 handlers can be added, the
+register/CSR state, registry metadata, assembler/decoder, third operand and
+numerical helpers must be implemented. See the guide's W10 prerequisite plan.

@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -std=c11 -Wall -Wextra -g -O0 \
+CFLAGS  := -MMD -MP -std=c11 -Wall -Wextra -g -O0 \
            -Icore -Iisa -Iassembler -Iui -Ipipeline
 LDFLAGS :=
 
@@ -13,16 +13,20 @@ SRCS := \
 	core/executor.c \
 	isa/rv32i_base.c \
 	assembler/assembler.c \
-	pipeline/control.c \
-	pipeline/hazard.c \
+	ui/cli_display.c \
 	pipeline/branch_predictor.c \
 	pipeline/bp_static.c \
 	pipeline/bp_dynamic.c \
+	pipeline/control.c \
+	pipeline/hazard.c \
 	pipeline/pipeline.c \
-	ui/cli_display.c \
 	main.c
 
 OBJS := $(SRCS:.c=.o)
+DEPS := $(OBJS:.o=.d) tests/pipeline_checks.d tests/predictor_checks.d
+
+-include $(DEPS)
+.DEFAULT_GOAL := all
 
 .PHONY: all clean run memcheck test
 
@@ -42,13 +46,17 @@ run: $(BIN)
 memcheck: $(BIN)
 	valgrind --error-exitcode=1 --leak-check=full ./$(BIN) $(PROG) --batch
 
-# Runs every .s file under tests/ in batch mode, just to smoke-test the build.
-test: $(BIN)
-	@for f in tests/*.s; do \
-		echo "=== $$f ==="; \
-		./$(BIN) "$$f" --batch || exit 1; \
-		echo; \
-	done
+# Regression suite checks the oracle, lab-sheet timing, supplied goldens,
+# and full architectural state (including memory on faults and exit).
+tests/pipeline_checks: tests/check_state.c $(filter-out main.o,$(OBJS))
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
+
+tests/predictor_checks: tests/check_predictor.c $(filter-out main.o,$(OBJS))
+	$(CC) $(CFLAGS) -o $@ $< $(filter-out main.o,$(OBJS)) $(LDFLAGS)
+
+test: $(BIN) tests/pipeline_checks tests/predictor_checks
+	./tests/predictor_checks
+	python3 tests/run_tests.py
 
 clean:
-	rm -f $(OBJS) $(BIN)
+	rm -f $(OBJS) $(DEPS) $(BIN) tests/pipeline_checks tests/predictor_checks

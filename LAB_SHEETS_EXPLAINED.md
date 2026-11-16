@@ -1,367 +1,303 @@
-# RISC-V Simulator Labs: The Conceptual & Implementation Handbook
+# Lab Sheets Explained: From Software to a Processor Model
 
-> **Target Audience**: A student or developer with zero prior knowledge of this repository who wants to understand what the computer architecture lab sheets are doing, why they exist, how the simulator models hardware in C, and how each lab builds progressively upon the last.
+No prior knowledge of this codebase is assumed. The five sheets describe one
+progression: first make instruction behavior correct, then overlap instructions,
+then recover the efficiency lost to dependencies and branches. Weeks 6–9 are
+implemented in `riscv_sim_base/`; Week 10 describes the next extension.
 
----
+## 1. What is a processor simulator?
 
-## Table of Contents
-1. [Zero-Knowledge Primer: What is a Processor Simulator?](#1-zero-knowledge-primer-what-is-a-processor-simulator)
-2. [The 5-Lab Journey: The Big Picture Roadmap](#2-the-5-lab-journey-the-big-picture-roadmap)
-3. [Lab 1 (Week 6): The Baseline Single-Cycle RV32I Processor](#3-lab-1-week-6-the-baseline-single-cycle-rv32i-processor)
-4. [Lab 2 (Week 7): Slicing Time — Building the 5-Stage Pipeline](#4-lab-2-week-7-slicing-time--building-the-5-stage-pipeline)
-5. [Lab 3 (Week 8): Data Hazards, Forwarding & Load-Use Interlocks](#5-lab-3-week-8-data-hazards-forwarding--load-use-interlocks)
-6. [Lab 4 (Week 9): Control Hazards, Branch Prediction & Pre-Decode](#6-lab-4-week-9-control-hazards-branch-prediction--pre-decode)
-7. [Lab 5 (Week 10): Floating-Point Arithmetic Extension (RV32F)](#7-lab-5-week-10-floating-point-arithmetic-extension-rv32f)
-8. [Codebase Map: How the C Files Map to Physical Silicon](#8-codebase-map-how-the-c-files-map-to-physical-silicon)
-9. [The Golden Invariants & Mathematical Identities](#9-the-golden-invariants--mathematical-identities)
+A processor reads instructions and changes registers or memory according to their
+meaning. A simulator is an ordinary program that performs those changes on a
+model. Here the simulator is written in C, and the programs it runs are RISC-V
+assembly files ending in `.s`. The host machine does not execute those assembly
+instructions directly: the simulator assembles, decodes and models them.
 
----
+A **register** is a small named storage location. A **program counter**, or PC,
+contains the address from which to fetch an instruction. **Memory** is a larger
+array of individually addressed bytes. In RV32I, ordinary supported instructions
+and integer registers are 32 bits wide. Four bytes make a 32-bit word.
 
-## 1. Zero-Knowledge Primer: What is a Processor Simulator?
+Consider `addi t0, zero, 5`: read zero, add 5, and put the result in t0. A later
+`add t1, t0, t0` should put 10 in t1. Register x0, whose ABI name is `zero`, always
+reads as zero regardless of attempted writes.
 
-### 1.1 "Software as Silicon"
-When electrical engineers design a CPU (like an Intel Core i7, an Apple M-series chip, or a RISC-V processor), they do not manufacture silicon chips on day one. Fabrication costs millions of dollars. Instead, they first write software models of the processor to test its logic, measure its speed, and count its clock cycles.
+## 2. What does “Software as Silicon” mean?
 
-This repository is **not** an operating system and **not** a hardware description file (Verilog/VHDL). It is a **cycle-accurate processor simulator written in C11**.
+It means using software structures to represent hardware state and rules, not
+turning this C program into a physical chip.
 
-Every hardware component on a physical motherboard is represented by a C data structure:
-- **Registers (The Scratchpad)**: An array `uint32_t regs[32]` inside a `CPUState` struct.
-- **Program Counter (PC)**: A 32-bit integer `uint32_t pc` storing the memory address of the current instruction.
-- **Main Memory (RAM)**: A flat array of bytes `uint8_t data[1048576]` (1 MB) inside a `Memory` struct.
-- **Clock Tick**: A function call (`execute_cycle()` or `pipeline_cycle()`). Calling the function once advances time by exactly **1 clock cycle**.
+| Hardware concept | C representation in this project |
+|---|---|
+| Integer register file | `CPUState.regs[32]` plus read/write accessors |
+| Program-counter register | `CPUState.pc` |
+| RAM | `Memory.data` byte array |
+| Instruction decoder | `decode_instruction` and registry lookup |
+| ALU | arithmetic/logic operations in handlers or the pipeline's `alu` helper |
+| Control wires | fields in `ControlSignals` |
+| Clocked interstage storage | IFID, IDEX, EXMEM and MEMWB structs |
+| Empty stage | a latch with valid=0 |
+| Operand bypass network | comparisons and selection in `forward_operands` |
+| Prediction table | a pipeline-owned `BPState.table[64]` |
 
-```text
-       PHYSICAL SILICON                         C CODE EQUIVALENT
-+-------------------------------+       +-------------------------------+
-|  32 Flip-Flop Registers       |  ==>  |  uint32_t regs[32];           |
-|  Program Counter (PC) Wire    |  ==>  |  uint32_t pc;                 |
-|  1 MB DRAM Chip               |  ==>  |  uint8_t mem_data[1048576];   |
-|  ALU (Adder / Logic Unit)     |  ==>  |  alu() function in C          |
-|  Clock Generator (Oscillator) |  ==>  |  Loop calling pipeline_cycle()|
-+-------------------------------+       +-------------------------------+
-```
+A real flip-flop changes stored state at a clock edge. A C struct does not change
+synchronously by itself. The simulator makes it act that way by reading the old
+struct, writing a next-state struct, then committing the latter once per modeled
+clock. RAM is modeled functionally, not as a bank of real memory transistors.
 
-### 1.2 What is RISC-V RV32I?
-- **RISC**: *Reduced Instruction Set Computer*. Unlike x86 (Intel/AMD), which has thousands of complex instructions, RISC architectures provide a small, simple, modular set of operations.
-- **RV32I**:
-  - `RV`: RISC-V.
-  - `32`: 32-bit architecture (registers and memory addresses are 32 bits wide).
-  - `I`: Base Integer instruction set (arithmetic, logic, memory loads/stores, branches, jumps). Everything else (multiplication `M`, floating point `F`, vectors `V`) is an optional extension.
+## 3. Week 6 / Lab 1: make one instruction correct
 
----
+### Goal
 
-## 2. The 5-Lab Journey: The Big Picture Roadmap
+Understand the original single-cycle processor before overlapping anything.
+“Single-cycle” here means that one executor call completes an instruction. For
+normal successful runs, cycles equal executed instructions and CPI is 1.
 
-The entire curriculum is designed as a progressive evolutionary chain. Each lab solves a fundamental limitation of the previous one:
+### The instruction's journey
 
 ```mermaid
-flowchart TD
-    L1["Lab 1 (Week 6): Baseline Single-Cycle\n• CPI = 1.0\n• 1 instruction per cycle\n• Functional Reference Oracle"]
-    L2["Lab 2 (Week 7): 5-Stage Pipeline\n• Slices work into IF, ID, EX, MEM, WB\n• Naive 3-latch stalling on RAW hazards\n• Heavy stall penalty!"]
-    L3["Lab 3 (Week 8): Data Hazards & Forwarding\n• Bypasses values from EX/MEM & MEM/WB to EX\n• Removes 95% of stalls\n• 1-cycle stall for Load-Use"]
-    L4["Lab 4 (Week 9): Branch Prediction\n• Pre-decodes JAL in IF (0-cycle penalty)\n• Predicts branches (not-taken, btfn, 1bit, 2bit)\n• Reduces mispredict flushes"]
-    L5["Lab 5 (Week 10): Floating Point (RV32F)\n• Adds second register file fregs[32] & fcsr\n• 26 IEEE-754 FP instructions\n• Zero changes to pipeline datapath"]
-
-    L1 --> L2
-    L2 --> L3
-    L3 --> L4
-    L4 --> L5
+flowchart LR
+    A[Assembly source] --> B[Two-pass assembler]
+    B --> C[32-bit words in memory]
+    C --> D[Fetch at PC]
+    D --> E[Decode and registry lookup]
+    E --> F[Execute handler]
+    F --> G[Registers / memory / next PC]
+    G --> D
 ```
 
-### The Immutable Law of the Course
-> **"Optimization changes WHEN instructions execute, never WHAT they compute."**
-> 
-> No matter whether you run in single-cycle mode, stalling pipeline mode, forwarding mode, or branch prediction mode, **the final register file (`x0`..`x31`) must match bit-for-bit across every single engine**. If an optimization produces a different register value, it is a bug, not an optimization.
+The assembler translates human-readable mnemonics into binary instruction words.
+The decoder recovers fields such as source registers, destination register and
+immediate constant. The registry connects a recognized encoding to a C function.
+Execution changes architectural state and chooses the next PC, usually PC+4.
 
----
+**Semantics**, **encoding** and **execution mechanism** are different questions:
+“what does add mean?”, “which bits represent add?”, and “which C operation models
+it?” Keeping those questions separate makes the source easier to follow.
 
-## 3. Lab 1 (Week 6): The Baseline Single-Cycle RV32I Processor
+### What to inspect
 
-### 3.1 The Problem It Solves
-Before you can overlap instructions in a complex pipeline, you must have a 100% mathematically correct functional model. Lab 1 builds that model: a **Single-Cycle Processor** where each instruction executes from start to finish in a single clock cycle ($\text{CPI} = 1.000$).
+Read `core/cpu_state.h`, `core/executor.c`, then an `exec_add` or `exec_lw` handler
+in `isa/rv32i_base.c`. Run `sample1_sum_loop.s`: it prints 55 in 53 cycles. This
+engine becomes the **oracle**, meaning the reference against which later engines
+are compared. An oracle is useful, but it can also contain bugs; independent
+provided expected outputs add a second source of evidence.
 
-This single-cycle engine serves as the **Reference Oracle** for the entire semester.
+## 4. Week 7 / Lab 2: overlap five stages
 
-### 3.2 How It Works (The 4-Step Cycle)
-Inside `core/executor.c`, the function `execute_cycle()` runs every clock tick:
-1. **Fetch**: Read 4 bytes (32 bits) of machine code from simulated RAM at address `cpu->pc`.
-2. **Decode**: Extract fields (opcode, destination register `rd`, source registers `rs1`, `rs2`, immediate values).
-3. **Execute**: Look up the instruction handler in `core/isa_registry.c` and run it (e.g., `exec_add`: `R[rd] = R[rs1] + R[rs2]`).
-4. **Update PC**: Advance `cpu->pc = cpu->next_pc` (usually `pc + 4`, or target address for jumps/taken branches).
+### Why a pipeline?
+
+An instruction has several kinds of work. A pipeline lets different instructions
+perform different kinds at once, like workstations on an assembly line:
+
+| Stage | Meaning | Main job |
+|---|---|---|
+| IF | Instruction Fetch | Read instruction word at the fetch PC |
+| ID | Instruction Decode | Decode fields, generate controls, read operands |
+| EX | Execute | Arithmetic, address calculation, branch/jump resolution |
+| MEM | Memory | Read/write data memory |
+| WB | Write Back | Finish the architectural result and retire |
 
 ```text
-                  +-----------------------------------+
-                  |         FETCH: RAM[pc]            |
-                  +-----------------+-----------------+
-                                    |
-                                    v
-                  +-----------------+-----------------+
-                  |      DECODE: opcode, rd, rs       |
-                  +-----------------+-----------------+
-                                    |
-                                    v
-                  +-----------------+-----------------+
-                  |      EXECUTE: ALU / Memory        |
-                  +-----------------+-----------------+
-                                    |
-                                    v
-                  +-----------------+-----------------+
-                  |    COMMIT: pc = next_pc           |
-                  +-----------------------------------+
+Clock:  1   2   3   4   5   6   7
+I1:    IF  ID  EX MEM  WB
+I2:        IF  ID  EX MEM  WB
+I3:            IF  ID  EX MEM  WB
 ```
 
-### 3.3 Key Architectural Highlights in the Codebase
-- **Strict `x0` Zero Enforcement**: In RISC-V, register `x0` is permanently wired to ground (`0`). Any write to `x0` is discarded. In `core/cpu_state.c`, `cpu_read_reg()` always returns `0` if index is `0`, and `cpu_write_reg()` silently returns without writing. This eliminates buggy checks in instruction handlers.
-- **The Plugin ISA Registry (`core/isa_registry.c`)**: Instead of a giant 2,000-line `switch(opcode)` statement, every instruction registers itself into a dynamic table with its bitfield patterns and execution function pointer. Adding a new instruction in later labs requires **zero changes** to the core engine.
-- **Two-Pass Assembler (`assembler/assembler.c`)**:
-  - **Pass 1**: Scans assembly text line by line to map label names (e.g., `loop:`) to memory addresses.
-  - **Pass 2**: Resolves forward branch/jump offsets and encodes instructions into 32-bit binary words.
+The stages contain different instructions. Data is handed to the next stage via
+a latch and becomes available there on the next clock, not immediately.
 
----
+### What the sheet asks you to build
 
-## 4. Lab 2 (Week 7): Slicing Time — Building the 5-Stage Pipeline
+Create control signals, four pipeline-latch structs and a five-stage clock.
+Retain the original engine as a reference. Add valid bits so an empty slot does
+nothing. Carry a fault down the pipeline instead of stopping as soon as it is
+noticed. Add conservative stalling and redirects so results remain correct.
 
-### 4.1 The Problem It Solves
-In a single-cycle processor, the clock cycle must be long enough for the slowest instruction (usually `lw`: Fetch $\to$ Decode $\to$ ALU $\to$ Memory Read $\to$ Register Write) to finish. While `lw` is accessing memory, the ALU and decoder sit idle.
+A **precise exception** means older instructions finish, the faulting instruction
+is reported, and younger instructions do not change the final architectural
+result. For example, fetch may already be reading zero-filled data after an exit
+instruction. If ID halted on that zero word immediately, it could prevent the
+older exit from finishing. Delaying the fault until WB lets age determine which
+instruction actually ends the run.
 
-Pipelining slices the execution of an instruction across **5 synchronous stages**:
-1. **IF (Instruction Fetch)**: Pulled from memory; `pc` advances.
-2. **ID (Instruction Decode & Register Read)**: Opcode decoded, registers read from register file.
-3. **EX (Execute / Address Calculation)**: ALU performs operation, branches evaluated.
-4. **MEM (Memory Access)**: Data memory read (`lw`) or write (`sw`).
-5. **WB (Writeback)**: Result written into destination register `rd`.
+### What is a bubble or a flush?
 
-Now, up to **5 different instructions are in flight at the exact same moment**:
+A **bubble** is an empty stage slot, represented by valid=0. It does not retire.
+A `nop` is different: it is a real encoded instruction and does retire.
 
-```text
-Cycle ->      1     2     3     4     5     6     7
-Instruction 1: IF    ID    EX    MEM   WB
-Instruction 2:       IF    ID    EX    MEM   WB
-Instruction 3:             IF    ID    EX    MEM   WB
-Instruction 4:                   IF    ID    EX    MEM   WB
-Instruction 5:                         IF    ID    EX    MEM   WB
-```
+A **flush** discards younger instructions because their path was wrong. In the
+sheet timing mode, EX can fetch the target in its redirect clock, losing one
+slot. The supplied reference model restarts target fetch the next clock and
+charges two cycles. Always identify the timing model before comparing counts.
 
-### 4.2 Hardware Latches & Preventing "Time Travel"
-Stages cannot talk to each other directly in the same cycle. Instead, they write into boundary registers called **latches**:
-- `IF/ID` latch: Holds fetched machine word and PC.
-- `ID/EX` latch: Holds decoded registers, immediate values, control signals.
-- `EX/MEM` latch: Holds ALU result, store data.
-- `MEM/WB` latch: Holds memory load result or ALU result for writeback.
+## 5. Week 8 / Lab 3: dependencies and bypasses
 
-#### The Snapshot/Commit Pattern in C
-In software, C executes sequentially. If the EX stage writes into `EX/MEM` before the MEM stage reads `EX/MEM`, MEM reads *future* data!
-To model hardware registers faithfully, Lab 2 mandates the **Snapshot/Commit** pattern:
-```c
-CPUStatus pipeline_cycle(Pipeline *p, CPUState *cpu, Memory *mem) {
-    Pipeline nx = *p;   /* Snapshot current state into 'nx' (next state) */
+### The problem: an instruction wants a value too soon
 
-    /* EVERY stage reads from 'p->...' (old state) and writes to 'nx....' (next state) */
-    stage_wb(p, &nx, cpu);
-    stage_mem(p, &nx, mem);
-    stage_ex(p, &nx);
-    stage_id(p, &nx, cpu);
-    stage_if(p, &nx, mem, cpu);
-
-    *p = nx;            /* Commit: one clock edge advances all latches simultaneously */
-    return cpu->status;
-}
-```
-
-### 4.3 Control Signals (`pipeline/control.c`)
-In hardware, the decode stage generates control wires that travel alongside the instruction like a passport:
-- `reg_write`: Does this instruction write back to `rd`?
-- `mem_read`: Does it read RAM?
-- `mem_write`: Does it write RAM?
-- `is_branch`: Is it a conditional branch?
-- `is_jump`: Is it an unconditional jump (`jal`/`jalr`)?
-
-### 4.4 Naive Stalling & Precise Exceptions
-- **RAW Hazard**: If instruction 2 reads register `x1` which instruction 1 hasn't written back yet, Lab 2 solves it naively: **freeze IF and ID, and inject an empty bubble (`valid = 0`) into EX**.
-- **Precise Exceptions**: If an instruction causes a memory fault or illegal instruction, the CPU must **not** halt immediately. Older instructions ahead of it in the pipeline must finish and retire first. Faults are tagged onto latches (`PF_ILLEGAL`, `PF_MEM`) and only trigger a CPU halt when they reach **WB**.
-
----
-
-## 5. Lab 3 (Week 8): Data Hazards, Forwarding & Load-Use Interlocks
-
-### 5.1 The Problem It Solves
-Lab 2's naive stalling ruins performance. In back-to-back operations:
 ```asm
-addi t0, zero, 5    # Producer: writes t0 in WB (Cycle 5)
-addi t1, t0, 10     # Consumer: reads t0 in ID (Cycle 3) -> Stalls for 3 cycles!
+addi t0, zero, 5
+addi t1, t0, 10
 ```
-The consumer waits for `t0` to reach the register file, even though the ALU finished computing `5` at the end of Cycle 3!
 
-### 5.2 The Forwarding Unit (`pipeline/hazard.c`)
-Instead of waiting for writeback, we run physical "bypass wires" directly from the pipeline latches back into the inputs of the EX stage:
-1. **EX/MEM Forwarding (Distance 1, Highest Priority)**: The instruction in MEM has its computed result sitting in `ex_mem.alu_result`. We forward it straight to the ALU input.
-2. **MEM/WB Forwarding (Distance 2)**: The instruction in WB has its result in `mem_wb.wb_val`. We forward it to the ALU input.
+The second instruction must read the 5 produced by the first. In the pipeline,
+it may reach ID before that value reaches the register file. This is a
+**read-after-write dependency**, abbreviated RAW. If unhandled, it silently reads
+an old value; the instruction meanings can be correct while program results are
+wrong because their timing is wrong.
+
+A **stall** waits for the value. This project's stall holds IF/ID, freezes fetch,
+and inserts an EX bubble. Older instructions keep progressing. Forgetting any
+one of the three actions can skip an instruction or repeat work incorrectly.
+
+### Forwarding is a shortcut to an existing result
+
+The value may already exist in an older pipeline latch even though it has not
+been written to the register file. **Forwarding**, also called **bypassing**,
+sends that existing result directly to the consumer's EX input.
 
 ```text
-               +-----------------------+
-               |   EX/MEM.alu_result   |------+ (Distance 1: Newer, Priority!)
-               +-----------------------+      |
-               +-----------------------+      |
-               |     MEM/WB.wb_val     |----+ | (Distance 2: Older)
-               +-----------------------+    | |
-                                            v v
-      ID/EX.rs1_val --------------------> [ MUX ] ===> ALU Input A
-      ID/EX.rs2_val --------------------> [ MUX ] ===> ALU Input B & Store Data
+Result from instruction currently in MEM ----+
+Final value from instruction currently in WB -+--> choose newest --> EX input
+Operand captured earlier in ID --------------+
 ```
 
-#### Where Forwarded Operands Must Be Used
-Students often forward to ALU inputs but forget the other three places:
-1. **ALU Operands** (`alu(..., o.a, o.b)`)
-2. **Store Data** (`store_val = o.b` — e.g., `sw t0, 0(sp)` after `addi t0`)
-3. **Branch Comparisons** (`branch_taken(..., o.a, o.b)` — e.g., `beq t0, t1, label`)
-4. **JALR Target** (`(o.a + imm) & ~1u`)
+If both older instructions write the same register, the newer producer wins.
+Forwarding must also feed store data, branch comparisons and jalr targets; they
+consume registers just as arithmetic does. x0, unused encoding fields and empty
+slots must not create fake hazards.
 
-### 5.3 The Load-Use Hazard (The Unavoidable 1-Cycle Stall)
-Forwarding eliminates almost all stalls, **except one**:
-```asm
-lw   t0, 0(sp)      # Value does NOT exist until the END of MEM (Cycle 4)
-addi t1, t0, 1      # Value is NEEDED at the START of EX (Cycle 4)
-```
-Data cannot travel backwards in time. Therefore, when a consumer in ID depends on a memory load currently in `ID/EX`, the **Hazard Detection Unit must inject exactly 1 stall cycle**.
-After 1 stall, the load is in `MEM/WB`, and normal forwarding supplies the operand to EX.
+### Why loads still need a stall
 
----
+For `lw t0, 0(gp)` followed by `addi t1, t0, 1`, the load calculates an **address**
+in EX and obtains **data** at the end of MEM. The next instruction would need
+that data at the beginning of EX during the same clock. A shortcut cannot deliver
+a value before it exists. One stall postpones the consumer, after which MEM/WB
+contains the data. The load's address must never be mistaken for its result.
 
-## 6. Lab 4 (Week 9): Control Hazards, Branch Prediction & Pre-Decode
+### What improves?
 
-### 6.1 The Problem It Solves
-In a 5-stage pipeline, the next instruction must be fetched in IF *every single cycle*. But for conditional branches (`beq`, `bne`, etc.), the condition is computed in **EX** (3 cycles later).
-If the pipeline freezes and waits for EX, every branch wastes 2 cycles.
-If the pipeline assumes fall-through (`not-taken`) and the branch is actually taken, the two instructions fetched behind it must be squashed (flushed), wasting 2 cycles.
+For `micro.s`, the same five instructions take 15 sheet-stalling clocks and
+9 sheet-forwarding clocks. Both give the same registers. The dependencies still
+exist; forwarding changes where the consumers obtain their operands.
 
-### 6.2 Pre-Decode in IF: Free `jal` Jumps
-For direct jumps (`jal ra, label`), the jump target is purely a function of the current PC and the 20-bit immediate in the instruction word.
-Lab 4 adds a small combinational pre-decoder in the IF stage:
-- If opcode is `0x6F` (`jal`), IF calculates the target address and redirects itself on the **very same cycle**.
-- **Result**: `jal` costs **0 penalty cycles**! (In programs with frequent subroutine calls like `t4_calls.s`, this saves 66 cycles before any branch predictor even runs).
-- Indirect jumps (`jalr`) read an integer register that IF cannot see, so `jalr` always incurs a **2-cycle penalty**.
+WAR (write-after-read) and WAW (write-after-write) are not hazards in this fixed,
+in-order five-stage model because all instructions read and write in order.
+More complex out-of-order or variable-latency designs need additional mechanisms.
 
-### 6.3 Branch Predictors: Guessing Direction in IF
-For conditional branches, the pipeline asks a predictor in IF: *"Taken or Not-Taken?"*
-1. **Static `not-taken`**: Always predicts fall-through (`pc + 4`).
-2. **Static `btfn` (Backward Taken, Forward Not-Taken)**:
-   - Loop branches jump backwards (`target < pc`), so guess **Taken**.
-   - If/else blocks jump forward over code (`target >= pc`), so guess **Not-Taken**.
-   - Requires zero history tables, yet achieves ~79% accuracy!
-3. **Dynamic `1bit` Predictor**:
-   - Uses a 64-entry array indexed by `pc[7:2]`.
-   - Remembers what the branch did last time ($0 = \text{Not-Taken}, 1 = \text{Taken}$).
-   - Weakness: In nested loops, it mispredicts twice per loop execution (on exit, and on re-entry).
-4. **Dynamic `2bit` Saturating Counter (Hysteresis)**:
-   - Each of the 64 entries has a 2-bit counter with 4 states:
-     - `0`: Strongly Not-Taken
-     - `1`: Weakly Not-Taken *(Reset Default)*
-     - `2`: Weakly Taken
-     - `3`: Strongly Taken
-   - Predicts Taken if counter $\ge 2$.
-   - **Why it wins**: When a loop finishes, the exit branch only drops the counter from `3` to `2`. When the loop is re-entered, the counter is still $\ge 2$ and predicts Taken correctly!
+## 6. Week 9 / Lab 4: choose a path before you know the answer
+
+### Why prediction is needed
+
+A conditional branch such as `bne t0, zero, loop` has two possible next addresses.
+IF must select one before EX has compared the operands. A **branch predictor**
+guesses direction using limited information, not the actual register values.
+Correct guesses preserve overlap; incorrect ones are recovered with a flush.
+
+The lab interface has three operations: reset initial state, predict without
+changing state, and update when EX knows the outcome. A wrong-path branch
+squashed before EX never becomes an actual training example.
+
+### The four predictors
+
+| Predictor | Intuition | Memory |
+|---|---|---|
+| not-taken | Keep walking forward | None |
+| btfn | Backward branches usually repeat loops; forward branches usually fall through | None |
+| 1bit | Guess what this table entry did last time | 64 one-bit values stored in bytes |
+| 2bit | Change a confident guess only after more evidence | 64 saturating two-bit counters stored in bytes |
+
+Two-bit **hysteresis** means resistance to changing direction after one surprise.
+A taken outcome moves the counter right; a not-taken outcome moves it left:
 
 ```text
-       Predict NOT-TAKEN                    Predict TAKEN
-  [ 0: Strongly N ] <===> [ 1: Weakly N ] <===> [ 2: Weakly T ] <===> [ 3: Strongly T ]
-         ^                                                                   ^
-    Saturates at 0                                                      Saturates at 3
-  (Does NOT wrap!)                                                    (Does NOT wrap!)
+0 <--> 1 <--> 2 <--> 3
+predict N     predict T
 ```
 
----
+Movement stops at the endpoints. Wrapping 3 to 0 would turn confidence in taken
+into confidence in not-taken after another taken outcome—the opposite of learning.
+Counters start at 1, weakly not taken. A loop exit can reduce 3 to 2 without
+making the next loop entry predict not-taken.
 
-## 7. Lab 5 (Week 10): Floating-Point Arithmetic Extension (RV32F)
+**Aliasing** means two branch addresses select the same entry. Here the index is
+PC bits 7:2, so a separation of 256 bytes produces a collision. The table has no
+labels/tags to distinguish them. Their outcomes can reinforce or disrupt each
+other. The supplied adversarial sample intentionally demonstrates this.
 
-### 7.1 The Problem It Solves
-High-performance computing requires single-precision floating-point arithmetic (IEEE 754).
-The architectural objective of Lab 5 is profound:
-> **Add a completely new instruction set extension (RV32F) with 32 new registers and a status register WITHOUT altering the core pipeline datapath.**
+### Direct versus indirect jumps
 
-### 7.2 The New Silicon Components
-1. **Floating-Point Registers (`f0` through `f31`)**:
-   - Unlike integer `x0`, **`f0` is an ordinary register and can hold non-zero values**.
-   - Unified register indexing: integer registers are `1..31`, floating-point registers are mapped to `32..63`.
-   - Because the registers share a unified numbering space, the Lab 3 Forwarding and Hazard units automatically handle floating-point RAW dependencies!
-2. **Floating-Point Control & Status Register (`fcsr`)**:
-   - Bits 7:5: Rounding Mode (`frm`): `rne` (ties to even), `rtz` (toward 0), `rdn` ($-\infty$), `rup` ($+\infty$), `rmm` (ties away from 0), `dyn` (dynamic).
-   - Bits 4:0: Sticky Exception Flags: `NV` (Invalid), `DZ` (Divide by Zero), `OF` (Overflow), `UF` (Underflow), `NX` (Inexact).
-   - Accrues flags automatically across arithmetic operations.
-3. **The 26 Instructions (Implemented in `isa/rv32f.c`)**:
-   - **Bit Manipulation (No arithmetic, no rounding, no flags)**: `flw`, `fsw`, `fsgnj.s` (`fmv.s`), `fsgnjn.s` (`fneg.s`), `fsgnjx.s` (`fabs.s`), `fmv.x.w`, `fmv.w.x`, `fclass.s`.
-   - **Arithmetic**: `fadd.s`, `fsub.s`, `fmul.s`, `fdiv.s`, `fsqrt.s`, and 4 Fused Multiply-Adds (`fmadd.s`, `fmsub.s`, `fnmsub.s`, `fnmadd.s`).
-   - **Comparisons & Conversions**: `feq.s` (quiet), `flt.s` (signalling), `fle.s` (signalling), `fmin.s`, `fmax.s`, `fcvt.w.s`, `fcvt.wu.s`, `fcvt.s.w`, `fcvt.s.wu`.
+A direct `jal` encodes its target, so IF can follow it immediately with zero
+redirect penalty. `jalr` depends on a register and is not predicted here; it
+costs two redirect cycles. A **return-address stack** (RAS) could help predict
+function returns, but W9 does not implement one.
 
-### 7.3 Traps for the Unwary (Why RISC-V Differs from Standard C)
-- **Canonical NaN**: RISC-V mandates that any invalid operation producing a NaN must return `0x7fc00000`. Native x86 FPU operations return `0xffc00000` (sign bit set). The simulator must canonicalize NaNs.
-- **Ordered Zeros**: `+0.0` (`0x00000000`) and `-0.0` (`0x80000000`) compare equal in C (`==`), but `fmin.s(-0.0, +0.0)` must return `-0.0`.
-- **Ties to Even**: In default rounding (`rne`), `2.5` rounds to `2`, while `3.5` rounds to `4`.
-- **Conversion Saturation**: Converting out-of-range or NaN floats to integers must saturate to maximum/minimum integer bounds rather than invoking undefined C behavior.
+Dynamic is not automatically better. BTFN has no learning delay and is fastest
+in aggregate on the supplied three W9 samples; two-bit helps some patterns but
+cannot represent every alternating/history-dependent behavior.
 
----
+## 7. Week 10 / Lab 5: numbers with fractions, still pending
 
-## 8. Codebase Map: How the C Files Map to Physical Silicon
+Integer registers hold whole-number bit patterns. **Floating point** represents
+numbers with a sign, exponent and fraction, trading finite precision for a wide
+range of magnitudes. Binary32 uses 1 sign bit, 8 exponent bits and 23 fraction
+bits; normal values also have an implicit leading significand bit.
 
-| C Source File | Physical Hardware Component | Lab Added | What it Does |
-| :--- | :--- | :---: | :--- |
-| `core/cpu_state.c/.h` | Architectural Register File | Lab 1 | Holds `regs[32]`, `pc`, machine status, diagnostic faults. |
-| `core/memory.c/.h` | DRAM Main Memory | Lab 1 | 1 MB flat byte-addressed storage, little-endian word loading. |
-| `core/decoder.c/.h` | Instruction Decoder Wires | Lab 1 | Extracts bit slices (`opcode`, `rd`, `rs1`, sign-extended immediates). |
-| `core/isa_registry.c/.h` | Dynamic Instruction Dispatcher | Lab 1 | Lookup table mapping bitfields to function pointer handlers. |
-| `core/executor.c/.h` | Single-Cycle Control Unit | Lab 1 | Runs sequential fetch-decode-execute loop (Reference Oracle). |
-| `isa/rv32i_base.c/.h` | RV32I Execution Functional Units | Lab 1 | Implements ALU handlers (`add`, `sub`, `sll`, `slt`, etc.). |
-| `assembler/assembler.c/.h`| Assembly Toolchain | Lab 1 | Two-pass assembler parsing labels, directives, and pseudo-ops (`la`). |
-| `ui/cli_display.c/.h` | Debugger Hardware Console | Lab 1 | REPL prompt, register dumper, memory inspector. |
-| `pipeline/control.c/.h` | Pipeline Control Generator | Lab 2 | Decodes control signals (`reg_write`, `mem_read`, etc.) in ID. |
-| `pipeline/pipeline_state.h`| Clock Latches (Registers) | Lab 2 | Declares `IF/ID`, `ID/EX`, `EX/MEM`, `MEM/WB` structures. |
-| `pipeline/hazard.c/.h` | Hazard Detection & Forwarding Unit | Labs 2-3 | Detects RAW hazards, executes 1-cycle load-use stalls, controls forwarding muxes. |
-| `pipeline/branch_predictor.c/.h`| Branch Prediction Controller | Lab 4 | Predictor registry and table lookup dispatch. |
-| `pipeline/bp_static.c` | Static Direction Predictors | Lab 4 | Implements `not-taken` and `btfn`. |
-| `pipeline/bp_dynamic.c`| Dynamic Saturating Counters | Lab 4 | Implements `1bit` and `2bit` predictors with 64-entry tables. |
-| `pipeline/pipeline.c` | 5-Stage Synchronous Datapath | Labs 2-4 | Snapshot/commit loop, stage executions, squashes, `--trace`. |
-| `isa/rv32f.c` *(Lab 5)* | RV32F Floating-Point Unit | Lab 5 | 26 single-precision floating-point handlers. |
+The next sheet asks for 26 FP instructions, FP registers, rounding rules and
+exception flags. A second register file means f0 is a normal writable register,
+unlike x0. Fused multiply-add needs a third source operand and rounds the entire
+multiply-plus-add once, which can differ from two separately rounded operations.
 
----
+A **NaN** is a bit pattern meaning “not a number”, for example the arithmetic
+result of 0/0. A **canonical NaN** is the standard result bit pattern chosen for
+arithmetic, 0x7fc00000 in this specification. Quiet and signalling NaNs behave
+differently for flags. Raw-bit moves and sign manipulation preserve payloads;
+they are not ordinary numerical calculations.
 
-## 9. The Golden Invariants & Mathematical Identities
+Rounding chooses a representable value when the exact result cannot be stored.
+The five modes are nearest/ties-even, toward zero, down, up and nearest/ties-away.
+A status register, fcsr, records rounding mode and sticky NV/DZ/OF/UF/NX flags:
+invalid operation, division by zero, overflow, underflow and inexact result.
+Sticky means a flag remains set until software clears it.
 
-To verify that your simulator is operating with 100% cycle accuracy, verify these mathematical identities across every run:
+The supplied f1/f2/f3 programs are future reference fixtures, not runnable tests
+yet. This project does not contain the FP registers, CSR instructions, numerical
+helpers or extended pipeline assumed by that sheet. The comprehensive guide
+lists the preparation needed before implementing the handlers.
 
-### 1. Functional Integrity Invariant (Every Lab)
-$$\text{Final Registers}_{\text{Pipeline}} \equiv \text{Final Registers}_{\text{Oracle}}$$
-$$\text{Retired Instructions}_{\text{Pipeline}} \equiv \text{Cycles}_{\text{Single-Cycle Oracle}}$$
+## 8. How to judge a result
 
-### 2. Lab 2 & Lab 3 Clock Cycle Accounting Identity
-$$\text{cycles} = \text{retired} + \text{stalls} + 2 \times \text{flushes} + 4$$
-- `retired`: Instructions that reach the WB stage and exit.
-- `stalls`: Clock cycles where ID is held and a bubble is inserted into EX.
-- `flushes`: Clock cycles lost to branch redirects (each branch flush squashes 2 instructions).
-- `4`: Pipeline fill latency (it takes 4 cycles before the very first instruction reaches WB).
+Three different questions must be answered independently:
 
-### 3. Lab 4 Branch Prediction Clock Cycle Accounting Identity
-$$\text{cycles} = \text{retired} + 4 + 2 \times \text{redirects} + \text{stalls}$$
-$$\text{redirects} = \text{mispredicts} + \text{jalr}$$
-- `jal` is pre-decoded in IF and produces **0 redirects**.
-- Every conditional branch mispredict causes **1 redirect** (2 squashed instructions = 2 penalty cycles).
-- Every indirect jump `jalr` causes **1 redirect** (2 penalty cycles).
+1. **Behavior:** are registers, memory, output and status correct?
+2. **Timing:** do clocks and events follow the selected pipeline rules?
+3. **Explanation:** can the difference be attributed to fills, data waits and
+   control redirects rather than a guessed “speedup”?
 
----
+For successful runs:
 
-## Quick Reference Commands
+$$\mathrm{CPI}=\frac{\mathrm{cycles}}{\mathrm{instructions\ retired}}.$$
 
-```powershell
-# 1. Run automated verification for Labs 1-4
-python verify_all.py
+“Retired” means finished in program order at WB; fetched or squashed instructions
+do not count. Safe engines retire the same meaningful instruction sequence as
+the single-cycle oracle. Bubbles never inflate the count, and x0 stays zero.
 
-# 2. Run the 12 sample test programs matching Cycles references.md
-python check_sample_tests.py
+For normal runs without speculative terminal overlap:
 
-# 3. Run single-cycle oracle
-.\riscv_sim_base\rvsim.exe sample_tests\lab1_skeleton\s1_alu.s --batch
+$$C_{sheet}=I+S+F+4,\qquad C_{reference}=I+S+2F+4.$$
 
-# 4. Run with data forwarding
-.\riscv_sim_base\rvsim.exe sample_tests\lab3_hazards\h1_broad.s --pipeline-forward
+For W9:
 
-# 5. Run with 2-bit branch predictor and trace
-.\riscv_sim_base\rvsim.exe riscv_sim_base\tests\t1_counted_loop.s --batch --predictor 2bit --trace
-```
+$$\mathrm{redirects}=\mathrm{mispredicts}+\mathrm{jalr},$$
+
+$$\mathrm{accuracy}=100\frac{\mathrm{branches}-\mathrm{mispredicts}}{\mathrm{branches}}.$$
+
+A younger stall can overlap the final exit-drain clocks without delaying exit.
+The simulator reports these events as `discarded_stalls`; subtract that overlap
+when applying the equation to those tested cases. Faulted and cycle-limited runs
+need not satisfy the normal-completion identity. Do not compare final PCs between
+engines: the pipeline PC is ahead because it points to speculative fetch work.
+
+The next useful step is [the tutorial](tutorial.md): run a sample, read the status
+and summary, compare registers, then inspect a short clock trace.
