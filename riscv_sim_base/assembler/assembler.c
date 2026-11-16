@@ -298,7 +298,7 @@ static uint32_t encode_instruction(const InstructionHandler *h, Fields f) {
  * emitting a redundant lui for small constants. */
 
 static int pseudo_instruction_size(const char *mnemonic) {
-    if (strcmp(mnemonic, "li") == 0) return 8;
+    if (strcmp(mnemonic, "li") == 0 || strcmp(mnemonic, "la") == 0) return 8;
     if (strcmp(mnemonic, "nop") == 0) return 4;
     if (strcmp(mnemonic, "ret") == 0) return 4;
     if (strcmp(mnemonic, "j") == 0) return 4;
@@ -353,8 +353,8 @@ static int assemble_pseudo(const char *mnemonic, char *operand_str, SymbolTable 
         memory_write_word(mem, addr, encode_instruction(h, f));
         return ASM_OK;
     }
-    if (strcmp(mnemonic, "li") == 0) {
-        if (n != 2) return set_err(err, lineno, ASM_ERR_SYNTAX, "expected 'li rd, imm'");
+    if (strcmp(mnemonic, "li") == 0 || strcmp(mnemonic, "la") == 0) {
+        if (n != 2) return set_err(err, lineno, ASM_ERR_SYNTAX, "expected 'li/la rd, imm/label'");
         uint32_t rd;
         if (parse_register(tok[0], &rd, err, lineno) != ASM_OK) return ASM_ERR_BAD_OPERAND;
         int32_t value;
