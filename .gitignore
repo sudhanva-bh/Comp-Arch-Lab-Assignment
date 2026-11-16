@@ -1,0 +1,25 @@
+# Object & dependency files
+*.o
+*.d
+
+# Compiled executables & libraries
+rvsim
+rvsim.exe
+*.exe
+*.out
+*.app
+*.pdb
+*.ilk
+
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor & OS artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
