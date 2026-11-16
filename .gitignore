@@ -23,3 +23,6 @@ venv/
 Thumbs.db
 .vscode/
 .idea/
+
+riscv_sim_base/tests/pipeline_checks
+riscv_sim_base/tests/predictor_checks
